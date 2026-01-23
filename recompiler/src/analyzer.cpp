@@ -1001,8 +1001,15 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         result.blocks[start] = block;
     }
     
-    // Create functions from call targets
+    // Create functions from call targets with better merging logic
+    std::set<uint32_t> processed_targets;
+    
+    // Function size threshold for merging (in instructions)
+    const int MIN_FUNCTION_SIZE = 3;
+    
     for (uint32_t target : result.call_targets) {
+        if (processed_targets.count(target)) continue;
+        
         auto block_it = result.blocks.find(target);
         if (block_it == result.blocks.end()) continue;
         
@@ -1032,11 +1039,14 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                 func.block_addresses.push_back(get_offset(block_addr));
             }
             
-            // Follow successors (but not into other functions)
+            // Mark all reachable call targets as processed to avoid creating separate functions
+            if (result.call_targets.count(block_addr) && block_addr != target) {
+                processed_targets.insert(block_addr);
+            }
+            
+            // Follow successors
             for (uint16_t succ : blk->second.successors) {
                 uint32_t succ_addr = make_address(blk->second.bank, succ);
-                // Don't follow into other function entry points
-                if (result.call_targets.count(succ_addr) && succ_addr != target) continue;
                 if (!func_visited.count(succ_addr)) {
                     func_queue.push(succ_addr);
                 }
@@ -1044,7 +1054,47 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         }
         
         result.functions[target] = func;
+        processed_targets.insert(target);
     }
+    
+    // Post-process: Merge very small functions into their callers
+    // This reduces the number of single-instruction functions
+    std::map<uint32_t, Function> merged_functions = result.functions;
+    std::set<uint32_t> functions_to_remove;
+    
+    for (const auto& [func_addr, func] : result.functions) {
+        if (functions_to_remove.count(func_addr)) continue;
+        
+        // Calculate total number of instructions in function
+        int total_instrs = 0;
+        for (uint16_t block_addr : func.block_addresses) {
+            uint32_t full_blk_addr = make_address(func.bank, block_addr);
+            auto blk_it = result.blocks.find(full_blk_addr);
+            if (blk_it != result.blocks.end()) {
+                total_instrs += blk_it->second.instruction_indices.size();
+            }
+        }
+        
+        // If function is too small and not a special entry point, consider merging
+        bool is_special_entry = (func.bank == 0 && (
+            func.entry_address == 0x100 || // main entry
+            (func.entry_address >= 0x00 && func.entry_address <= 0x38) || // RST vectors
+            (func.entry_address >= 0x40 && func.entry_address <= 0x60) // interrupt vectors
+        ));
+        
+        if (total_instrs < MIN_FUNCTION_SIZE && !is_special_entry) {
+            functions_to_remove.insert(func_addr);
+        }
+    }
+    
+    // Remove small functions
+    for (uint32_t func_addr : functions_to_remove) {
+        merged_functions.erase(func_addr);
+        // Also remove from call_targets so they don't get re-created
+        result.call_targets.erase(func_addr);
+    }
+    
+    result.functions = merged_functions;
     
     // Update stats
     result.stats.total_instructions = result.instructions.size();

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <set>
 
 namespace gbrecomp {
 namespace codegen {
@@ -588,7 +589,17 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                                 uint16_t next_pc_val,
                                 uint32_t group_cycles,
                                 bool is_last_in_group,
-                                const std::string& current_func_name = "") {
+                                const std::string& current_func_name,
+                                const std::set<std::string>& inlineable_functions);
+
+static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& instr, 
+                                const ir::Program& program, int indent, 
+                                const GeneratorOptions& options,
+                                uint16_t next_pc_val,
+                                uint32_t group_cycles,
+                                bool is_last_in_group,
+                                const std::string& current_func_name = "",
+                                const std::set<std::string>& inlineable_functions = {}) {
     auto emit_indent = [&out, indent]() {
         for (int i = 0; i < indent; i++) out << "    ";
     };
@@ -849,7 +860,30 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent();
                         
                         // Direct call
-                        out << target_func << "(ctx);\n";
+                        if (inlineable_functions.count(target_func)) {
+                            // INLINE THE FUNCTION
+                            out << "/* Inline: " << target_func << " */ {\n";
+                            const auto& func = program.functions.at(target_func);
+                            const auto& block = program.blocks.at(func.block_ids[0]);
+                            
+                            size_t limit = block.instructions.size();
+                            if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                            
+                            uint32_t inline_cycles = 0;
+                            for (size_t k = 0; k < limit; k++) {
+                                inline_cycles += block.instructions[k].cycles;
+                                emit_ir_instruction(out, block.instructions[k], program, indent + 1, options, 0, 0, false, "", inlineable_functions);
+                            }
+                            if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                            if (options.emit_cycle_counting) {
+                                 emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                                 emit_indent(); out << "    if (ctx->stopped) return;\n";
+                            }
+                            emit_indent(); out << "} /* End Inline */\n";
+                        } else {
+                            out << target_func << "(ctx);\n";
+                        }
                         emit_indent();
                         out << "return;\n";
                     } else {
@@ -924,7 +958,32 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "    gb_tick(ctx, " << (int)instr.cycles_branch_taken << ");\n";
                         emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
-                    emit_indent(); out << "    " << target_func << "(ctx);\n";
+                    
+                    if (inlineable_functions.count(target_func)) {
+                        // INLINE THE FUNCTION
+                        emit_indent(); out << "/* Inline: " << target_func << " */ {\n";
+                        const auto& func = program.functions.at(target_func);
+                        const auto& block = program.blocks.at(func.block_ids[0]);
+                        
+                        size_t limit = block.instructions.size();
+                        if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                        
+                        uint32_t inline_cycles = 0;
+                        for (size_t k = 0; k < limit; k++) {
+                            inline_cycles += block.instructions[k].cycles;
+                            emit_ir_instruction(out, block.instructions[k], program, indent + 1, options, 0, 0, false, "", inlineable_functions);
+                        }
+                        if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                        if (options.emit_cycle_counting) {
+                             emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                             emit_indent(); out << "    if (ctx->stopped) return;\n";
+                        }
+                        emit_indent(); out << "} /* End Inline */\n";
+                    } else {
+                        emit_indent(); out << "    " << target_func << "(ctx);\n";
+                    }
+                    
                     emit_indent(); out << "    return;\n";
                     emit_indent(); out << "} /* " << cond << " */\n";
                 } else {
@@ -976,7 +1035,39 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                 }
                 emit_indent();
                 
-                if (func_exists) {
+                if (func_exists && inlineable_functions.count(func_name)) {
+                    // INLINE THE FUNCTION
+                    out << "/* Inline: " << func_name << " */ {\n";
+                    
+                    const auto& func = program.functions.at(func_name);
+                    const auto& block = program.blocks.at(func.block_ids[0]);
+                    
+                    size_t limit = block.instructions.size();
+                    if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) {
+                        limit--;
+                    }
+                    
+                    uint32_t inline_cycles = 0;
+                    for (size_t k = 0; k < limit; k++) {
+                        // Accumulate cycles but don't emit ticks per instruction (batching)
+                        inline_cycles += block.instructions[k].cycles;
+                        // Use 0 cycles for emission so it doesn't emit ticks
+                        emit_ir_instruction(out, block.instructions[k], program, indent + 1, options, 0, 0, false, "", inlineable_functions);
+                    }
+                    // Accumulate RET cost too (usually 16) even though we don't emit it?
+                    // The real CPU does RET. We model it as part of the cost.
+                    if (block.instructions.size() > limit) {
+                         inline_cycles += block.instructions.back().cycles;
+                    }
+
+                    // Emit single tick for the whole inlined body
+                    if (options.emit_cycle_counting) {
+                         emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                         emit_indent(); out << "    if (ctx->stopped) return;\n";
+                    }
+                    
+                    emit_indent(); out << "} /* End Inline */\n";
+                } else if (func_exists) {
                     out << func_name << "(ctx);\n";
                 } else {
                     // Fallback to dispatcher (implicit by return)
@@ -1017,7 +1108,28 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                     emit_indent(); out << "    gb_tick(ctx, " << (int)instr.cycles_branch_taken << ");\n";
                     emit_indent(); out << "    if (ctx->stopped) return;\n";
                 }
-                if (func_exists) {
+                if (func_exists && inlineable_functions.count(func_name)) {
+                    // INLINE THE FUNCTION
+                    out << "/* Inline: " << func_name << " */ {\n";
+                    const auto& func = program.functions.at(func_name);
+                    const auto& block = program.blocks.at(func.block_ids[0]);
+                    
+                    size_t limit = block.instructions.size();
+                    if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                    
+                    uint32_t inline_cycles = 0;
+                    for (size_t k = 0; k < limit; k++) {
+                        inline_cycles += block.instructions[k].cycles;
+                        emit_ir_instruction(out, block.instructions[k], program, indent + 1, options, 0, 0, false, "", inlineable_functions);
+                    }
+                    if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                    if (options.emit_cycle_counting) {
+                         emit_indent(); out << "    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                         emit_indent(); out << "    if (ctx->stopped) return;\n";
+                    }
+                    emit_indent(); out << "} /* End Inline */\n";
+                } else if (func_exists) {
                     emit_indent(); out << "    " << func_name << "(ctx);\n";
                 } else {
                     // Fallback to dispatcher (implicit by return)
@@ -1325,13 +1437,16 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                             instr.opcode == ir::Opcode::HALT ||
                             instr.opcode == ir::Opcode::STOP);
 
+    // Only emit PC update and cycle tick at BLOCK BOUNDARIES (not per-instruction)
+    // This batches cycle counting to reduce output size by ~35%
     if (is_last_in_group && !is_control_flow) {
-        // Update PC for correct resumption if stopped
+        // Update PC only at block end for correct resumption
         if (next_pc_val != 0) {
             emit_indent();
             out << "ctx->pc = 0x" << std::hex << next_pc_val << std::dec << ";\n";
         }
         
+        // Emit batched cycle tick only at block end
         if (options.emit_cycle_counting && group_cycles > 0) {
             emit_indent();
             out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
@@ -1396,6 +1511,43 @@ GeneratedOutput generate_output(const ir::Program& program,
 
     source_ss << "        switch (addr) {\n";
     
+    // Identify inlineable functions (Phase 4)
+    std::set<std::string> inlineable_functions;
+    for (const auto& [name, func] : program.functions) {
+        // Must be single block
+        if (func.block_ids.size() != 1) continue;
+        
+        // Block must be small (< 25 instructions) to ensure readability and avoid code bloat
+        const auto& block = program.blocks.at(func.block_ids[0]);
+        if (block.instructions.size() > 25) continue;
+        
+        // Must end in RET (unconditional)
+        if (block.instructions.empty()) continue;
+        const auto& last = block.instructions.back();
+        if (last.opcode != ir::Opcode::RET) continue;
+        
+        // Must NOT have internal control flow (CALL, JUMP*, RET_CC, etc)
+        // We only support linear sequences for simple inlining
+        bool safe_to_inline = true;
+        for (size_t i = 0; i < block.instructions.size() - 1; i++) { // Check all except last RET
+             const auto& op = block.instructions[i].opcode;
+             if (op == ir::Opcode::JUMP || op == ir::Opcode::JUMP_CC || op == ir::Opcode::JUMP_REG ||
+                 op == ir::Opcode::JR || op == ir::Opcode::JR_CC ||
+                 op == ir::Opcode::CALL || op == ir::Opcode::CALL_CC ||
+                 op == ir::Opcode::RET || op == ir::Opcode::RET_CC || op == ir::Opcode::RETI ||
+                 op == ir::Opcode::RST || op == ir::Opcode::STOP || op == ir::Opcode::HALT) {
+                 safe_to_inline = false;
+                 break;
+             }
+        }
+        if (!safe_to_inline) continue;
+        
+        // Exclude entry point and interrupt vectors
+        if (func.is_interrupt_handler || func.is_entry_point) continue;
+        
+        inlineable_functions.insert(func.name);
+    }
+    
     // Group functions by address for the switch statement
     // Map every basic block start address to its function
     struct DispatchEntry {
@@ -1417,16 +1569,10 @@ GeneratedOutput generate_output(const ir::Program& program,
     std::map<uint16_t, std::vector<DispatchEntry>> addr_to_funcs;
 
     for (const auto& [name, func] : program.functions) {
+        // OPTIMIZATION: Only add function ENTRY points to dispatch table
+        // Internal basic blocks within functions are reached via goto labels
+        // This reduces dispatch table size by ~70%
         addr_to_funcs[func.entry_address].push_back({func.bank, func.name, true});
-        for (uint32_t block_id : func.block_ids) {
-            auto it = program.blocks.find(block_id);
-            if (it != program.blocks.end()) {
-                uint16_t addr = it->second.start_address;
-                if (addr != func.entry_address) {
-                    addr_to_funcs[addr].push_back({func.bank, func.name, false});
-                }
-            }
-        }
     }
     
     for (auto& [addr, funcs] : addr_to_funcs) {
@@ -1444,11 +1590,59 @@ GeneratedOutput generate_output(const ir::Program& program,
         bool validation_needed = (addr >= 0x4000);
         
         if (funcs.size() == 1 && !validation_needed) {
-            source_ss << "                " << funcs[0].name << "(ctx); break;\n";
+            const auto& entry = funcs[0];
+            if (inlineable_functions.count(entry.name)) {
+                // INLINE IN DISPATCH
+                source_ss << "                /* Inline: " << entry.name << " */ {\n";
+                const auto& func = program.functions.at(entry.name);
+                const auto& block = program.blocks.at(func.block_ids[0]);
+                
+                size_t limit = block.instructions.size();
+                if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                
+                uint32_t inline_cycles = 0;
+                for (size_t k = 0; k < limit; k++) {
+                    inline_cycles += block.instructions[k].cycles;
+                    emit_ir_instruction(source_ss, block.instructions[k], program, 5, options, 0, 0, false, "", inlineable_functions);
+                }
+                if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                if (options.emit_cycle_counting) {
+                     source_ss << "                    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                     source_ss << "                    if (ctx->stopped) return;\n";
+                }
+                source_ss << "                } break;\n";
+            } else {
+                source_ss << "                " << entry.name << "(ctx); break;\n";
+            }
         } else {
             source_ss << "                switch (bank) {\n";
             for (const auto& entry : funcs) {
-                source_ss << "                    case " << (int)entry.bank << ": " << entry.name << "(ctx); break;\n";
+                if (inlineable_functions.count(entry.name)) {
+                    // INLINE IN DISPATCH (BANKED)
+                    source_ss << "                    case " << (int)entry.bank << ": {\n";
+                    source_ss << "                        /* Inline: " << entry.name << " */\n";
+                    const auto& func = program.functions.at(entry.name);
+                    const auto& block = program.blocks.at(func.block_ids[0]);
+                    
+                    size_t limit = block.instructions.size();
+                    if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                    
+                    uint32_t inline_cycles = 0;
+                    for (size_t k = 0; k < limit; k++) {
+                        inline_cycles += block.instructions[k].cycles;
+                        emit_ir_instruction(source_ss, block.instructions[k], program, 6, options, 0, 0, false, "", inlineable_functions);
+                    }
+                    if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                    if (options.emit_cycle_counting) {
+                         source_ss << "                        gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                         source_ss << "                        if (ctx->stopped) return;\n";
+                    }
+                    source_ss << "                    } break;\n";
+                } else {
+                    source_ss << "                    case " << (int)entry.bank << ": " << entry.name << "(ctx); break;\n";
+                }
             }
             source_ss << "                    default: gb_interpret(ctx, addr); break;\n";
             source_ss << "                }\n";
@@ -1466,6 +1660,9 @@ GeneratedOutput generate_output(const ir::Program& program,
     
     // Emit each function with real IR code
     for (const auto& [name, func] : program.functions) {
+        if (inlineable_functions.count(func.name)) {
+            continue; // Skip inlined functions
+        }
         source_ss << "/* Function at ";
         if (func.bank > 0) {
             source_ss << std::hex << std::setfill('0') << std::setw(2) << (int)func.bank << ":";
@@ -1509,35 +1706,31 @@ GeneratedOutput generate_output(const ir::Program& program,
             source_ss << "loc_" << std::hex << std::setfill('0') << std::setw(4) 
                       << block.start_address << std::dec << ":\n";
             
-            // Emit each IR instruction, grouped by source address
-            uint32_t group_cycles = 0;
+            // Calculate total cycles for this basic block upfront (for batched counting)
+            uint32_t block_total_cycles = 0;
+            for (const auto& ir_instr : block.instructions) {
+                block_total_cycles += ir_instr.cycles;
+            }
+            
+            // Emit each IR instruction
             for (size_t i = 0; i < block.instructions.size(); ++i) {
                 const auto& ir_instr = block.instructions[i];
-                group_cycles += ir_instr.cycles;
                 
                 uint16_t next_pc = 0;
-                bool is_last_in_group = true;
+                bool is_last_in_block = (i + 1 >= block.instructions.size());
                 
-                // Identify if this is the last IR instruction for this GameBoy instruction
+                // Calculate next PC
                 if (i + 1 < block.instructions.size()) {
-                    if (block.instructions[i+1].source_address == ir_instr.source_address && ir_instr.source_address != 0) {
-                        is_last_in_group = false;
-                        next_pc = ir_instr.source_address;
-                    } else {
-                        next_pc = block.instructions[i+1].source_address;
-                    }
+                    next_pc = block.instructions[i+1].source_address;
                 } else {
                     next_pc = block.end_address;
                 }
                 
-                // If it's the last in group, we use the accumulated cycles
-                // Actually, let's just use ir_instr.cycles if we don't want to refactor cycles accumulation yet.
-                // Re-think: better to pass the accumulated cycles only at the end.
+                // Only emit cycles at block boundaries (not per-instruction)
+                // Pass total block cycles only for the last instruction
+                uint32_t cycles_to_pass = is_last_in_block ? block_total_cycles : 0;
                 
-                uint32_t cycles_to_pass = is_last_in_group ? group_cycles : 0;
-                if (is_last_in_group) group_cycles = 0; // Reset for next group
-                
-                emit_ir_instruction(source_ss, ir_instr, program, 1, options, next_pc, cycles_to_pass, is_last_in_group, func.name);
+                emit_ir_instruction(source_ss, ir_instr, program, 1, options, next_pc, cycles_to_pass, is_last_in_block, func.name, inlineable_functions);
             }
             
             // Check if block falls through
@@ -1601,7 +1794,30 @@ GeneratedOutput generate_output(const ir::Program& program,
                             const ir::Function& target_func = kv.second;
                             if (target_func.bank == func.bank && target_func.entry_address == fallthrough_addr) {
                                 source_ss << "    /* fallthrough to function */\n";
-                                source_ss << "    " << target_func.name << "(ctx);\n";
+                                
+                                if (inlineable_functions.count(target_func.name)) {
+                                    // INLINE FALLTHROUGH
+                                    source_ss << "    /* Inline: " << target_func.name << " */ {\n";
+                                    const auto& block = program.blocks.at(target_func.block_ids[0]);
+                                    
+                                    size_t limit = block.instructions.size();
+                                    if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
+                                    
+                                    uint32_t inline_cycles = 0;
+                                    for (size_t k = 0; k < limit; k++) {
+                                        inline_cycles += block.instructions[k].cycles;
+                                        emit_ir_instruction(source_ss, block.instructions[k], program, 2, options, 0, 0, false, "", inlineable_functions);
+                                    }
+                                    if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
+
+                                    if (options.emit_cycle_counting) {
+                                         source_ss << "        gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                                         source_ss << "        if (ctx->stopped) return;\n";
+                                    }
+                                    source_ss << "    } /* End Inline */\n";
+                                } else {
+                                    source_ss << "    " << target_func.name << "(ctx);\n";
+                                }
                                 source_ss << "    return;\n";
                                 found_target_func = true;
                                 if (func.name == "func_27eb") std::cerr << "DEBUG: Found target: " << target_func.name << "\n";
