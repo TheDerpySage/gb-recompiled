@@ -24,6 +24,7 @@ static SDL_Texture* g_texture = NULL;
 static int g_scale = 3;
 static uint32_t g_last_frame_time = 0;
 static SDL_AudioDeviceID g_audio_device = 0;
+static SDL_GameController* g_controller = NULL;
 static bool g_vsync = true;
 
 /* Menu State */
@@ -161,6 +162,11 @@ void gb_platform_shutdown(void) {
         SDL_CloseAudioDevice(g_audio_device);
         g_audio_device = 0;
     }
+
+    if (g_controller) {
+        SDL_GameControllerClose(g_controller);
+        g_controller == NULL;
+    }
     
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
@@ -232,6 +238,16 @@ bool gb_platform_init(int scale) {
         return false;
     }
     fprintf(stderr, "[SDL] SDL initialized.\n");
+
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            g_controller = SDL_GameControllerOpen(i);
+            if (g_controller) {
+                fprintf(stderr, "[SDL] Controller: %s\n", SDL_GameControllerName(g_controller));
+                break;
+            }
+        }
+    }
     
     /* Initialize Audio */
     SDL_AudioSpec want, have;
@@ -334,6 +350,85 @@ bool gb_platform_poll_events(GBContext* ctx) {
             return false;
 
         switch (event.type) {
+                case SDL_CONTROLLERAXISMOTION: {
+                const int deadzone = 8000;
+
+                if (event.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX) {
+                    if (event.caxis.value > deadzone) {
+                        g_joypad_dpad &= ~0x01;
+                        g_joypad_dpad |= 0x02;
+                    } else if (event.caxis.value < -deadzone) {
+                        g_joypad_dpad &= ~0x02;
+                        g_joypad_dpad |= 0x01;
+                    } else {
+                        g_joypad_dpad |= 0x01;
+                        g_joypad_dpad |= 0x02;
+                    }
+                }
+
+                if (event.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
+                    if (event.caxis.value > deadzone) {
+                        g_joypad_dpad &= ~0x08;
+                        g_joypad_dpad |= 0x04;
+                    } else if (event.caxis.value < -deadzone) {
+                        g_joypad_dpad &= ~0x04;
+                        g_joypad_dpad |= 0x08;
+                    } else {
+                        g_joypad_dpad |= 0x04;
+                        g_joypad_dpad |= 0x08;
+                    }
+                }
+
+                break;
+            }
+
+            case SDL_CONTROLLERBUTTONDOWN:
+            case SDL_CONTROLLERBUTTONUP: {
+                bool pressed = (event.type == SDL_CONTROLLERBUTTONDOWN);
+
+                switch (event.cbutton.button) {
+                    case SDL_CONTROLLER_BUTTON_DPAD_UP:
+                        if (pressed) g_joypad_dpad &= ~0x04;
+                        else g_joypad_dpad |= 0x04;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+                        if (pressed) g_joypad_dpad &= ~0x08;
+                        else g_joypad_dpad |= 0x08;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+                        if (pressed) g_joypad_dpad &= ~0x02;
+                        else g_joypad_dpad |= 0x02;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+                        if (pressed) g_joypad_dpad &= ~0x01;
+                        else g_joypad_dpad |= 0x01;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_A:
+                        if (pressed) g_joypad_buttons &= ~0x01;
+                        else g_joypad_buttons |= 0x01;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_B:
+                        if (pressed) g_joypad_buttons &= ~0x02;
+                        else g_joypad_buttons |= 0x02;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_START:
+                        if (pressed) g_joypad_buttons &= ~0x08;
+                        else g_joypad_buttons |= 0x08;
+                        break;
+
+                    case SDL_CONTROLLER_BUTTON_BACK:
+                        if (pressed) g_joypad_buttons &= ~0x04;
+                        else g_joypad_buttons |= 0x04;
+                        break;
+                }
+            }
+
             case SDL_KEYDOWN:
             case SDL_KEYUP: {
                 bool pressed = (event.type == SDL_KEYDOWN);
