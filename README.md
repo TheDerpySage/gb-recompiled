@@ -74,6 +74,10 @@ ninja -C build
 cmake -G Ninja -S output/game -B output/game/build
 ninja -C output/game/build
 
+# Optional: lower or raise optimization for generated ROM sources
+# The generated CMake defaults these large files to -O1 for practical rebuild times.
+cmake -S output/game -B output/game/build -DGBRECOMP_GENERATED_OPT_LEVEL=2
+
 # Run!
 ./output/game/build/game
 ```
@@ -210,10 +214,65 @@ When running a recompiled game:
 
 | Option | Description |
 |--------|-------------|
-| `--input <script>` | Automate input from a script file |
+| `--input <script>` | Automate input from an inline script like `120:S:1,240:A:1` |
+| `--record-input <file>` | Record live keyboard/controller input to a text file using the same script format accepted by `--input` |
 | `--dump-frames <list>` | Dump specific frames as screenshots |
 | `--screenshot-prefix <path>` | Set screenshot output path |
+| `--log-file <file>` | Redirect stdout and stderr to a text log file for later inspection |
+| `--debug-performance` | Enable the full slowdown-debug preset: frame logs, vsync logs, fallback logs, and periodic audio stats |
 | `--trace-entries <file>` | Log all executed (Bank, PC) points to file |
+| `--log-slow-frames <ms>` | Log frames whose emulation plus render time exceeds the threshold |
+| `--log-slow-vsync <ms>` | Log pacing waits whose `gb_platform_vsync()` time exceeds the threshold |
+| `--log-frame-fallbacks` | Log any rendered frame that hit generated->interpreter fallback |
+| `--log-lcd-transitions` | Log exact LCDC on/off transitions and LCD-off span lengths in guest cycles |
+| `--smooth-lcd-transitions` | Force the SDL host smoother on for long guest frames, including LCD-off stretches (default) |
+| `--no-smooth-lcd-transitions` | Disable the SDL host smoother for long guest frames |
+| `--differential [steps]` | Compare generated execution against the interpreter for N steps (default `10000`) |
+| `--differential-frames <n>` | Stop differential mode after N completed frames |
+| `--differential-log <n>` | Print progress every N matched steps during differential mode |
+| `--differential-no-memory` | Skip full mutable-memory comparisons to speed up differential runs |
+| `--differential-log-fallbacks` | Log when generated execution falls back to the interpreter |
+| `--differential-fail-on-fallback` | Treat any generated->interpreter fallback as a failure |
+
+Example:
+
+```bash
+./output/game/build/game --differential 500000 --differential-log 100000
+```
+
+Capture a sharable log and record a manual repro session:
+
+```bash
+./output/game/build/game --log-file session.log --record-input session.input
+```
+
+Capture a useful slowdown log without manually enabling each individual perf flag:
+
+```bash
+./output/game/build/game --log-file perf.log --record-input perf.input --debug-performance
+```
+
+`--debug-performance` now also includes exact `[LCD]` transition lines plus `lcd_off_cycles`, `lcd_transitions`, and `lcd_spans` in the `[FRAME]` logs, which makes LCD-off slowdown analysis much easier.
+
+The SDL menu now enables `Smooth Slow Frames` by default. It keeps host presentation and pacing steady during long guest frames, showing a blank frame while the LCD is off and otherwise re-presenting the last completed framebuffer without changing guest emulation timing. You can toggle it at runtime from the settings menu or override it on launch with `--smooth-lcd-transitions` / `--no-smooth-lcd-transitions`.
+
+Replay the recorded input later with the existing `--input` flag:
+
+```bash
+./output/game/build/game --input "$(cat session.input)"
+```
+
+Compare LCD-off slowdown spans against a PyBoy replay of the same input script:
+
+```bash
+python3 tools/compare_lcd_transitions.py roms/game.gb \
+  --runtime-log perf.log \
+  --input-file perf.input \
+  --start-frame 200 \
+  --end-frame 500
+```
+
+The runtime side of that report uses exact LCDC transition logs. The PyBoy side is sampled at frame boundaries, so it is best used to confirm whether our LCD-off stretches are obviously longer or happening in different places than the reference.
 
 ### Controls
 

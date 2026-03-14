@@ -212,6 +212,10 @@ typedef struct GBAudio {
     int32_t hp_prev_in_r;
     int32_t hp_prev_out_l;
     int32_t hp_prev_out_r;
+
+    /* Last stereo sample produced by the mixer. */
+    int16_t last_output_left;
+    int16_t last_output_right;
     
 } GBAudio;
 
@@ -313,6 +317,8 @@ static void audio_reset_timing_state(GBAudio* apu) {
     apu->fs_step = 7;
     apu->sample_timer = 0;
     apu->sample_timer_fixed = 0;
+    apu->last_output_left = 0;
+    apu->last_output_right = 0;
 }
 
 static void audio_clock_frame_sequencer(GBAudio* apu) {
@@ -432,6 +438,17 @@ void gb_audio_reset(void* apu_ptr) {
     apu->nr51 = 0xF3;
     apu->nr52 = 0xF1; /* Audio ON */
     audio_debug_dump_state(NULL, apu, "reset");
+}
+
+void gb_audio_get_samples(void* audio, int16_t* left, int16_t* right) {
+    GBAudio* apu = (GBAudio*)audio;
+
+    if (left) {
+        *left = (apu != NULL) ? apu->last_output_left : 0;
+    }
+    if (right) {
+        *right = (apu != NULL) ? apu->last_output_right : 0;
+    }
 }
 
 uint8_t gb_audio_read(GBContext* ctx, uint16_t addr) {
@@ -826,6 +843,8 @@ void gb_audio_step(GBContext* ctx, uint32_t cycles) {
         int32_t mixed_right = right * (vol_r + 1) * 64;
         left = audio_apply_highpass(mixed_left, &apu->hp_prev_in_l, &apu->hp_prev_out_l);
         right = audio_apply_highpass(mixed_right, &apu->hp_prev_in_r, &apu->hp_prev_out_r);
+        apu->last_output_left = left;
+        apu->last_output_right = right;
 
         if (g_audio_debug_trace_enabled) {
             bool nonzero = (left != 0) || (right != 0);

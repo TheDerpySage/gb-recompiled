@@ -1,0 +1,1 @@
+-add symbol map support for function names

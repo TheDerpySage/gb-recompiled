@@ -23,6 +23,7 @@
  * ========================================================================== */
 
 bool gbrt_trace_enabled = false;
+bool gbrt_log_lcd_transitions = false;
 uint64_t gbrt_instruction_count = 0;
 uint64_t gbrt_instruction_limit = 0;
 
@@ -112,6 +113,27 @@ void gb_context_reset(GBContext* ctx, bool skip_bootrom) {
     ctx->ime_pending = 0;
     ctx->halted = 0;
     ctx->stopped = 0;
+    ctx->single_step_mode = 0;
+    ctx->last_joypad = 0xFF;
+    ctx->used_dispatch_fallback = 0;
+    ctx->dispatch_fallback_bank = 0;
+    ctx->dispatch_fallback_addr = 0;
+    ctx->frame_dispatch_fallbacks = 0;
+    ctx->total_dispatch_fallbacks = 0;
+    ctx->frame_first_fallback_bank = 0;
+    ctx->frame_first_fallback_addr = 0;
+    ctx->frame_last_fallback_bank = 0;
+    ctx->frame_last_fallback_addr = 0;
+    ctx->lcd_off_active = 0;
+    ctx->lcd_off_start_cycles = 0;
+    ctx->lcd_off_start_frame_cycles = 0;
+    ctx->frame_lcd_off_cycles = 0;
+    ctx->frame_lcd_transition_count = 0;
+    ctx->frame_lcd_off_span_count = 0;
+    ctx->last_lcd_off_span_cycles = 0;
+    ctx->total_lcd_off_cycles = 0;
+    ctx->total_lcd_transition_count = 0;
+    ctx->total_lcd_off_span_count = 0;
     
     /* Reset RTC state */
     ctx->rtc.s = 0;
@@ -370,13 +392,14 @@ uint8_t gb_read8(GBContext* ctx, uint16_t addr) {
     if (addr < 0xFF00) return 0xFF;
     if (addr < 0xFF80) {
         if (addr == 0xFF00) {
-             // DBG_GENERAL("Reading JOYP 0xFF00");
-             uint8_t joyp = ctx->io[0x00];
-             // Bits 6-7 always 1. Bits 4-5 return what was written.
-             uint8_t res = 0xC0 | (joyp & 0x30) | 0x0F;
-             if (!(joyp & 0x10)) res &= g_joypad_dpad;
-             if (!(joyp & 0x20)) res &= g_joypad_buttons;
-             return res;
+            const GBJoypadState* joypad = (const GBJoypadState*)ctx->joypad;
+            uint8_t joyp = ctx->io[0x00];
+            uint8_t dpad = joypad ? joypad->dpad : g_joypad_dpad;
+            uint8_t buttons = joypad ? joypad->buttons : g_joypad_buttons;
+            uint8_t res = 0xC0 | (joyp & 0x30) | 0x0F;
+            if (!(joyp & 0x10)) res &= dpad;
+            if (!(joyp & 0x20)) res &= buttons;
+            return res;
         }
         if (addr == 0xFF04) return (uint8_t)(ctx->div_counter >> 8);
         if (addr >= 0xFF40 && addr <= 0xFF4B) return ppu_read_register((GBPPU*)ctx->ppu, addr);
@@ -778,6 +801,36 @@ void gb_ret(GBContext* ctx) { ctx->pc = gb_pop16(ctx); }
 void gbrt_jump_hl(GBContext* ctx) { ctx->pc = ctx->hl; }
 void gb_rst(GBContext* ctx, uint8_t vec) { gb_push16(ctx, ctx->pc); ctx->pc = vec; }
 
+uint8_t gbrt_try_execute_hram_stub(GBContext* ctx, uint16_t addr) {
+    if (!ctx || addr < 0xFF80 || addr > 0xFFFE) {
+        return 0;
+    }
+
+    /* Match the interpreter's HRAM DMA shortcut exactly:
+     * - Optional "LD A,imm" prefix to load the DMA source high byte
+     * - "LDH (0x46),A" performs DMA and immediately returns from the helper
+     */
+    if (gb_read8(ctx, addr) == 0x3E &&
+        addr <= 0xFFFC &&
+        gb_read8(ctx, (uint16_t)(addr + 2)) == 0xE0 &&
+        gb_read8(ctx, (uint16_t)(addr + 3)) == 0x46) {
+        ctx->a = gb_read8(ctx, (uint16_t)(addr + 1));
+        ctx->pc = (uint16_t)(addr + 2);
+        gb_tick(ctx, 8);
+        return 1;
+    }
+
+    if (gb_read8(ctx, addr) == 0xE0 &&
+        addr < 0xFFFF &&
+        gb_read8(ctx, (uint16_t)(addr + 1)) == 0x46) {
+        gb_write8(ctx, 0xFF46, ctx->a);
+        gb_ret(ctx);
+        return 1;
+    }
+
+    return 0;
+}
+
 void gbrt_set_trace_file(const char* filename) {
     if (gbrt_trace_filename) free(gbrt_trace_filename);
     if (filename) gbrt_trace_filename = strdup(filename);
@@ -801,6 +854,82 @@ __attribute__((weak)) void gb_dispatch_call(GBContext* ctx, uint16_t addr) {
     ctx->pc = addr; 
 }
 
+void gbrt_note_dispatch_fallback(GBContext* ctx, uint8_t bank, uint16_t addr) {
+    if (!ctx) return;
+    if (ctx->frame_dispatch_fallbacks == 0) {
+        ctx->frame_first_fallback_bank = bank;
+        ctx->frame_first_fallback_addr = addr;
+    }
+    ctx->used_dispatch_fallback = 1;
+    ctx->dispatch_fallback_bank = bank;
+    ctx->dispatch_fallback_addr = addr;
+    ctx->frame_last_fallback_bank = bank;
+    ctx->frame_last_fallback_addr = addr;
+    ctx->frame_dispatch_fallbacks++;
+    ctx->total_dispatch_fallbacks++;
+}
+
+void gbrt_note_lcd_transition(GBContext* ctx, bool lcd_enabled, uint8_t old_lcdc, uint8_t new_lcdc, uint8_t ly, uint8_t mode) {
+    if (!ctx) return;
+
+    ctx->frame_lcd_transition_count++;
+    ctx->total_lcd_transition_count++;
+
+    if (!lcd_enabled) {
+        ctx->lcd_off_active = 1;
+        ctx->lcd_off_start_cycles = ctx->cycles;
+        ctx->lcd_off_start_frame_cycles = ctx->frame_cycles;
+
+        if (gbrt_log_lcd_transitions) {
+            fprintf(stderr,
+                    "[LCD] OFF cyc=%u frame_cycles=%u ly=%u mode=%s old=%02X new=%02X transition=%llu\n",
+                    ctx->cycles,
+                    ctx->frame_cycles,
+                    (unsigned)ly,
+                    ppu_mode_name(mode),
+                    (unsigned)old_lcdc,
+                    (unsigned)new_lcdc,
+                    (unsigned long long)ctx->total_lcd_transition_count);
+        }
+        return;
+    }
+
+    if (ctx->lcd_off_active) {
+        uint32_t span_cycles = ctx->cycles - ctx->lcd_off_start_cycles;
+        uint32_t span_frame_cycles = ctx->frame_cycles - ctx->lcd_off_start_frame_cycles;
+        ctx->lcd_off_active = 0;
+        ctx->last_lcd_off_span_cycles = span_cycles;
+        ctx->frame_lcd_off_span_count++;
+        ctx->total_lcd_off_span_count++;
+
+        if (gbrt_log_lcd_transitions) {
+            fprintf(stderr,
+                    "[LCD] ON cyc=%u frame_cycles=%u ly=%u mode=%s old=%02X new=%02X span_cycles=%u span_frame_cycles=%u frame_lcd_off_cycles=%u span_index=%llu\n",
+                    ctx->cycles,
+                    ctx->frame_cycles,
+                    (unsigned)ly,
+                    ppu_mode_name(mode),
+                    (unsigned)old_lcdc,
+                    (unsigned)new_lcdc,
+                    span_cycles,
+                    span_frame_cycles,
+                    ctx->frame_lcd_off_cycles,
+                    (unsigned long long)ctx->total_lcd_off_span_count);
+        }
+    } else if (gbrt_log_lcd_transitions) {
+        fprintf(stderr,
+                "[LCD] ON cyc=%u frame_cycles=%u ly=%u mode=%s old=%02X new=%02X span_cycles=0 span_frame_cycles=0 frame_lcd_off_cycles=%u span_index=%llu\n",
+                ctx->cycles,
+                ctx->frame_cycles,
+                (unsigned)ly,
+                ppu_mode_name(mode),
+                (unsigned)old_lcdc,
+                (unsigned)new_lcdc,
+                ctx->frame_lcd_off_cycles,
+                (unsigned long long)ctx->total_lcd_off_span_count);
+    }
+}
+
 /* ============================================================================
  * Timing & Hardware Sync
  * ========================================================================== */
@@ -817,6 +946,14 @@ static inline void gb_sync(GBContext* ctx) {
 void gb_add_cycles(GBContext* ctx, uint32_t cycles) {
     ctx->cycles += cycles;
     ctx->frame_cycles += cycles;
+    if (ctx->run_cycle_budget > 0 &&
+        (ctx->cycles - ctx->run_cycle_budget_start) >= ctx->run_cycle_budget) {
+        ctx->stopped = 1;
+    }
+    if (ctx->lcd_off_active) {
+        ctx->frame_lcd_off_cycles += cycles;
+        ctx->total_lcd_off_cycles += cycles;
+    }
 }
 
 
@@ -1032,9 +1169,25 @@ void gb_handle_interrupts(GBContext* ctx) {
 
 uint32_t gb_run_frame(GBContext* ctx) {
     gb_reset_frame(ctx);
+    return gb_run_cycles(ctx, 0);
+}
+
+uint32_t gb_run_cycles(GBContext* ctx, uint32_t max_cycles) {
     uint32_t start = ctx->cycles;
+    uint32_t previous_budget = ctx->run_cycle_budget;
+    uint32_t previous_budget_start = ctx->run_cycle_budget_start;
+    bool bounded_run = (max_cycles > 0 && max_cycles != UINT32_MAX);
+
+    if (bounded_run) {
+        ctx->run_cycle_budget = max_cycles;
+        ctx->run_cycle_budget_start = start;
+    }
 
     while (!ctx->frame_done) {
+        if (max_cycles > 0 && (ctx->cycles - start) >= max_cycles) {
+            break;
+        }
+
         gb_handle_interrupts(ctx);
         
         /* Check for HALT exit condition (even if IME=0) */
@@ -1049,6 +1202,12 @@ uint32_t gb_run_frame(GBContext* ctx) {
         else gb_step(ctx);
         gb_sync(ctx);
     }
+
+    if (bounded_run) {
+        ctx->run_cycle_budget = previous_budget;
+        ctx->run_cycle_budget_start = previous_budget_start;
+    }
+
     return ctx->cycles - start;
 }
 
@@ -1069,9 +1228,48 @@ uint32_t gb_step(GBContext* ctx) {
     return ctx->cycles - start;
 }
 
+uint32_t gb_debug_step(GBContext* ctx, GBExecutionMode mode) {
+    uint32_t start = ctx->cycles;
+
+    gb_handle_interrupts(ctx);
+
+    /* Match gb_run_frame() scheduling around HALT exit and stopped state. */
+    if (ctx->halted && (ctx->io[0x0F] & ctx->io[0x80] & 0x1F)) {
+        ctx->halted = 0;
+    }
+
+    ctx->stopped = 0;
+
+    if (ctx->halted) {
+        gb_tick(ctx, 4);
+        return ctx->cycles - start;
+    }
+
+    uint8_t saved_single_step = ctx->single_step_mode;
+    ctx->single_step_mode = 1;
+    ctx->used_dispatch_fallback = 0;
+
+    if (mode == GB_EXECUTION_INTERPRETER || ctx->halt_bug) {
+        gb_interpret(ctx, ctx->pc);
+    } else {
+        gb_dispatch(ctx, ctx->pc);
+    }
+
+    ctx->single_step_mode = saved_single_step;
+    return ctx->cycles - start;
+}
+
 void gb_reset_frame(GBContext* ctx) {
     ctx->frame_done = 0;
     ctx->frame_cycles = 0;
+    ctx->frame_dispatch_fallbacks = 0;
+    ctx->frame_first_fallback_bank = 0;
+    ctx->frame_first_fallback_addr = 0;
+    ctx->frame_last_fallback_bank = 0;
+    ctx->frame_last_fallback_addr = 0;
+    ctx->frame_lcd_off_cycles = 0;
+    ctx->frame_lcd_transition_count = 0;
+    ctx->frame_lcd_off_span_count = 0;
     if (ctx->ppu) ppu_clear_frame_ready((GBPPU*)ctx->ppu);
 }
 

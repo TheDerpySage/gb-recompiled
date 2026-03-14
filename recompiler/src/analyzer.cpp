@@ -230,6 +230,7 @@ struct AnalysisState {
     int known_e;
     int known_h;
     int known_l;
+    int known_sp;
     uint8_t current_bank;
 };
 
@@ -389,6 +390,89 @@ static int is_likely_valid_code(const ROM& rom, uint8_t bank, uint16_t addr) {
     return 0;
 }
 
+static bool is_uniform_padding(const ROM& rom, uint8_t bank, uint16_t addr, uint8_t value, size_t len) {
+    if (addr + len > 0x8000) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (rom.read_banked(bank, addr + i) != value) return false;
+    }
+    return true;
+}
+
+static bool has_plausible_branch_prefix(const ROM& rom, uint8_t bank, uint16_t addr) {
+    Decoder decoder(rom);
+    uint16_t curr = addr;
+    int instructions_checked = 0;
+    int nop_count = 0;
+    bool saw_memory_or_control = false;
+
+    while (instructions_checked < 8 && curr < 0x8000) {
+        Instruction instr = decoder.decode(curr, bank);
+        if (instr.type == InstructionType::UNDEFINED || instr.type == InstructionType::INVALID) {
+            return false;
+        }
+
+        if (instr.type == InstructionType::NOP && ++nop_count > 4) {
+            return false;
+        }
+
+        if (instr.type == InstructionType::LD_A_NN || instr.type == InstructionType::LD_NN_A ||
+            instr.type == InstructionType::LD_NN_SP || instr.type == InstructionType::LD_RR_NN ||
+            instr.is_call || instr.is_jump) {
+            uint16_t imm = (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N)
+                               ? 0
+                               : instr.imm16;
+            if (imm != 0) {
+                if (imm >= 0xFEA0 && imm <= 0xFEFF) return false;
+                if (imm >= 0xE000 && imm <= 0xFDFF) return false;
+            }
+        }
+
+        if (instr.reads_memory || instr.writes_memory || instr.is_call || instr.is_jump || instr.is_return) {
+            saw_memory_or_control = true;
+        }
+
+        instructions_checked++;
+
+        if (instr.is_return || instr.type == InstructionType::JP_HL) {
+            return saw_memory_or_control;
+        }
+
+        if (instr.is_jump && !instr.is_conditional) {
+            return saw_memory_or_control;
+        }
+
+        curr += instr.length;
+    }
+
+    return instructions_checked >= 5 && saw_memory_or_control;
+}
+
+static bool is_likely_direct_branch_target(const ROM& rom, uint8_t bank, uint16_t addr) {
+    if (addr >= 0x8000) return false;
+
+    if (is_uniform_padding(rom, bank, addr, 0x00, 8) ||
+        is_uniform_padding(rom, bank, addr, 0xFF, 8)) {
+        return false;
+    }
+
+    Decoder decoder(rom);
+    Instruction instr = decoder.decode(addr, bank);
+    if (instr.type == InstructionType::UNDEFINED || instr.type == InstructionType::INVALID) {
+        return false;
+    }
+
+    // Direct branch targets are often tiny stubs, especially bank-end trampolines.
+    if (instr.is_jump || instr.is_call || instr.is_return || instr.type == InstructionType::JP_HL) {
+        return true;
+    }
+
+    if (has_plausible_branch_prefix(rom, bank, addr)) {
+        return true;
+    }
+
+    return is_likely_valid_code(rom, bank, addr) != 0;
+}
+
 /**
  * @brief Scan for 16-bit pointers that likely lead to code
  */
@@ -408,7 +492,8 @@ static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, st
                 uint32_t full_addr = make_address(tbank, target);
                 if (result.call_targets.find(full_addr) == result.call_targets.end()) {
                     result.call_targets.insert(full_addr);
-                    work_queue.push({full_addr, -1, -1, -1, -1, -1, -1, -1, (tbank > 0 ? tbank : (uint8_t)1)});
+                    result.strong_call_targets.insert(full_addr);
+                    work_queue.push({full_addr, -1, -1, -1, -1, -1, -1, -1, -1, (tbank > 0 ? tbank : (uint8_t)1)});
                 }
             }
         }
@@ -422,7 +507,9 @@ static void find_pointer_entry_points(const ROM& rom, AnalysisResult& result, st
 /**
  * @brief Load entry points from a runtime trace file
  */
-static void load_trace_entry_points(const std::string& path, std::set<uint32_t>& call_targets) {
+static void load_trace_entry_points(const std::string& path,
+                                    std::set<uint32_t>& call_targets,
+                                    std::set<uint32_t>& strong_call_targets) {
     if (path.empty()) return;
 
     std::ifstream file(path);
@@ -439,7 +526,9 @@ static void load_trace_entry_points(const std::string& path, std::set<uint32_t>&
             try {
                 int bank = std::stoi(line.substr(0, colon));
                 int addr = std::stoi(line.substr(colon + 1), nullptr, 16);
-                call_targets.insert(make_address(bank, addr));
+                uint32_t target = make_address(bank, addr);
+                call_targets.insert(target);
+                strong_call_targets.insert(target);
                 count++;
             } catch (...) {
                 continue;
@@ -469,6 +558,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     
     // Entry point is always a function (bank 0)
     result.call_targets.insert(make_address(0, 0x100));
+    result.strong_call_targets.insert(make_address(0, 0x100));
     
     // RST vectors
     bool skip_rst30 = rst28_uses_rst30(rom);
@@ -476,28 +566,31 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         if (is_rst_padding(rom, vec)) continue;
         if (vec == 0x30 && skip_rst30) continue;
         result.call_targets.insert(make_address(0, vec));
+        result.strong_call_targets.insert(make_address(0, vec));
     }
     
     // Interrupt vectors
     for (uint16_t vec : result.interrupt_vectors) {
         result.call_targets.insert(make_address(0, vec));
+        result.strong_call_targets.insert(make_address(0, vec));
     }
 
     // Load from trace if provided
-    load_trace_entry_points(options.trace_file_path, result.call_targets);
+    load_trace_entry_points(options.trace_file_path, result.call_targets, result.strong_call_targets);
 
     // Initial work queue seeding
     for (uint32_t target : result.call_targets) {
         uint8_t bank = get_bank(target);
-        work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
+        work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
     }
     
     // Manual entry points
     for (uint32_t target : options.entry_points) {
         if (result.call_targets.find(target) == result.call_targets.end()) {
             result.call_targets.insert(target);
+            result.strong_call_targets.insert(target);
             uint8_t bank = get_bank(target);
-            work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
+            work_queue.push({target, -1, -1, -1, -1, -1, -1, -1, -1, (bank > 0 ? bank : (uint8_t)1)});
         }
     }
     
@@ -507,8 +600,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         for (uint8_t bank : known_banks) {
                 if (bank > 0) {
                     if (is_likely_valid_code(rom, bank, 0x4000)) {
-                        work_queue.push({make_address(bank, 0x4000), -1, -1, -1, -1, -1, -1, -1, bank});
+                        work_queue.push({make_address(bank, 0x4000), -1, -1, -1, -1, -1, -1, -1, -1, bank});
                         result.call_targets.insert(make_address(bank, 0x4000));
+                        result.strong_call_targets.insert(make_address(bank, 0x4000));
                     } else {
                         // std::cout << "[INFO] Skipping likely data bank " << (int)bank << " at 0x4000\n";
                     }
@@ -520,15 +614,17 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
     for (const auto& ov : options.ram_overlays) {
         uint32_t addr = make_address(0, ov.ram_addr);
         result.call_targets.insert(addr);
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, 1});
+        result.strong_call_targets.insert(addr);
+        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, -1, 1});
     }
 
     // Add manual entry points
     for (uint32_t addr : options.entry_points) {
         result.call_targets.insert(addr);
+        result.strong_call_targets.insert(addr);
         uint8_t bank = get_bank(addr);
         uint8_t context = (bank > 0) ? bank : 1;
-        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, context});
+        work_queue.push({addr, -1, -1, -1, -1, -1, -1, -1, -1, context});
     }
     
     // Multi-pass analysis
@@ -549,6 +645,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         int known_e = item.known_e;
         int known_h = item.known_h;
         int known_l = item.known_l;
+        int known_sp = item.known_sp;
         uint8_t current_switchable_bank = item.current_bank;
         
         if (visited.count(addr)) continue;
@@ -621,6 +718,10 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             if (known_h != -1 && known_l != -1) return (known_h << 8) | known_l;
             return -1;
         };
+        auto set_known_hl = [&](int value) {
+            known_h = (value >> 8) & 0xFF;
+            known_l = value & 0xFF;
+        };
 
         // Helper to get combined registers
         auto get_known_bc = [&]() -> int { if (known_b != -1 && known_c != -1) return (known_b << 8) | known_c; return -1; };
@@ -638,6 +739,7 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
         else if (instr.opcode == 0x01) { known_b = (instr.imm16 >> 8); known_c = instr.imm16 & 0xFF; }
         else if (instr.opcode == 0x11) { known_d = (instr.imm16 >> 8); known_e = instr.imm16 & 0xFF; }
         else if (instr.opcode == 0x21) { known_h = (instr.imm16 >> 8); known_l = instr.imm16 & 0xFF; }
+        else if (instr.opcode == 0x31) { known_sp = instr.imm16; }
         // LD r, r'
         else if (instr.opcode >= 0x40 && instr.opcode <= 0x7F && instr.opcode != 0x76) {
             int* regs[] = {&known_b, &known_c, &known_d, &known_e, &known_h, &known_l, nullptr, &known_a};
@@ -655,28 +757,105 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                  // but we only track constant ROM.
             }
         }
+        else if (instr.opcode == 0x2A || instr.opcode == 0x3A) {
+            int mhl = get_known_hl();
+            if (mhl != -1 && mhl < 0x8000) {
+                known_a = rom.read_banked(mhl < 0x4000 ? 0 : bank, (uint16_t)mhl);
+                set_known_hl((instr.opcode == 0x2A) ? ((mhl + 1) & 0xFFFF) : ((mhl - 1) & 0xFFFF));
+            } else {
+                known_a = -1;
+                known_h = -1;
+                known_l = -1;
+            }
+        }
+        else if (instr.opcode == 0x22 || instr.opcode == 0x32) {
+            int mhl = get_known_hl();
+            if (mhl != -1) {
+                set_known_hl((instr.opcode == 0x22) ? ((mhl + 1) & 0xFFFF) : ((mhl - 1) & 0xFFFF));
+            } else {
+                known_h = -1;
+                known_l = -1;
+            }
+        }
         else if (instr.opcode == 0xAF) known_a = 0; // XOR A
+        else if (instr.opcode == 0x03 || instr.opcode == 0x13 || instr.opcode == 0x23 || instr.opcode == 0x33) {
+            int value = -1;
+            if (instr.opcode == 0x03) value = get_known_bc();
+            else if (instr.opcode == 0x13) value = get_known_de();
+            else if (instr.opcode == 0x23) value = get_known_hl();
+            else value = known_sp;
+
+            if (value != -1) {
+                value = (value + 1) & 0xFFFF;
+                if (instr.opcode == 0x03) { known_b = value >> 8; known_c = value & 0xFF; }
+                else if (instr.opcode == 0x13) { known_d = value >> 8; known_e = value & 0xFF; }
+                else if (instr.opcode == 0x23) set_known_hl(value);
+                else known_sp = value;
+            } else if (instr.opcode == 0x23) {
+                known_h = -1;
+                known_l = -1;
+            } else if (instr.opcode == 0x33) {
+                known_sp = -1;
+            }
+        }
+        else if (instr.opcode == 0x0B || instr.opcode == 0x1B || instr.opcode == 0x2B || instr.opcode == 0x3B) {
+            int value = -1;
+            if (instr.opcode == 0x0B) value = get_known_bc();
+            else if (instr.opcode == 0x1B) value = get_known_de();
+            else if (instr.opcode == 0x2B) value = get_known_hl();
+            else value = known_sp;
+
+            if (value != -1) {
+                value = (value - 1) & 0xFFFF;
+                if (instr.opcode == 0x0B) { known_b = value >> 8; known_c = value & 0xFF; }
+                else if (instr.opcode == 0x1B) { known_d = value >> 8; known_e = value & 0xFF; }
+                else if (instr.opcode == 0x2B) set_known_hl(value);
+                else known_sp = value;
+            } else if (instr.opcode == 0x2B) {
+                known_h = -1;
+                known_l = -1;
+            } else if (instr.opcode == 0x3B) {
+                known_sp = -1;
+            }
+        }
         // ADD HL, rr
-        else if (instr.opcode == 0x09 || instr.opcode == 0x19 || instr.opcode == 0x29) {
+        else if (instr.opcode == 0x09 || instr.opcode == 0x19 || instr.opcode == 0x29 || instr.opcode == 0x39) {
             int val = -1;
             if (instr.opcode == 0x09) val = get_known_bc();
             if (instr.opcode == 0x19) val = get_known_de();
             if (instr.opcode == 0x29) val = get_known_hl();
+            if (instr.opcode == 0x39) val = known_sp;
             int mhl = get_known_hl();
             if (mhl != -1 && val != -1) {
                 int res = (mhl + val) & 0xFFFF;
-                known_h = (res >> 8); known_l = res & 0xFF;
+                set_known_hl(res);
             } else { known_h = -1; known_l = -1; }
+        }
+        else if (instr.opcode == 0xE8) {
+            if (known_sp != -1) known_sp = (known_sp + instr.offset) & 0xFFFF;
+        }
+        else if (instr.opcode == 0xF8) {
+            if (known_sp != -1) set_known_hl((known_sp + instr.offset) & 0xFFFF);
+            else { known_h = -1; known_l = -1; }
+        }
+        else if (instr.opcode == 0xF9) {
+            known_sp = get_known_hl();
         }
         // Invalidate A on ALU
         else if ((instr.opcode >= 0x80 && instr.opcode <= 0xBF) || (instr.opcode & 0xC7) == 0x06 || instr.opcode == 0x3C || instr.opcode == 0x3D) {
             known_a = -1;
         }
         // POPs
-        else if (instr.opcode == 0xC1) { known_b = -1; known_c = -1; }
-        else if (instr.opcode == 0xD1) { known_d = -1; known_e = -1; }
-        else if (instr.opcode == 0xE1) { known_h = -1; known_l = -1; }
-        else if (instr.opcode == 0xF1) { known_a = -1; }
+        else if (instr.opcode == 0xC1) { known_b = -1; known_c = -1; known_sp = -1; }
+        else if (instr.opcode == 0xD1) { known_d = -1; known_e = -1; known_sp = -1; }
+        else if (instr.opcode == 0xE1) { known_h = -1; known_l = -1; known_sp = -1; }
+        else if (instr.opcode == 0xF1) { known_a = -1; known_sp = -1; }
+        else if (instr.opcode == 0xC5 || instr.opcode == 0xD5 || instr.opcode == 0xE5 || instr.opcode == 0xF5 ||
+                 instr.opcode == 0xC9 || instr.opcode == 0xD9 || instr.opcode == 0xCD || instr.opcode == 0xC4 ||
+                 instr.opcode == 0xCC || instr.opcode == 0xD4 || instr.opcode == 0xDC ||
+                 (instr.opcode & 0xC7) == 0xC7) {
+            known_sp = -1;
+        }
 
         /* -------------------------------------------------------------
          * Bank Switching Detection
@@ -733,7 +912,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             if (is_rst_padding(rom, instr.rst_vector)) continue;
             
             result.call_targets.insert(make_address(0, instr.rst_vector));
-            work_queue.push({make_address(0, instr.rst_vector), -1, -1, -1, -1, -1, -1, -1, 1});
+            result.strong_call_targets.insert(make_address(0, instr.rst_vector));
+            work_queue.push({make_address(0, instr.rst_vector), -1, -1, -1, -1, -1, -1, -1, -1, 1});
             
             bool is_rst28_jt = (instr.rst_vector == 0x28 && is_rst28_jump_table(rom));
             if (is_rst28_jt) {
@@ -744,52 +924,64 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
 
                     if (is_likely_valid_code(rom, tbank, target)) {
                         result.call_targets.insert(make_address(tbank, target));
-                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
+                        result.strong_call_targets.insert(make_address(tbank, target));
+                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, -1, tbank});
                         result.label_addresses.insert(make_address(tbank, target));
                     }
                 }
             } else {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
                 result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
             }
         } else if (instr.is_call) {
             uint16_t target = instr.imm16;
             uint8_t tbank = target_bank(target);
             instr.resolved_target_bank = tbank;
-            
+
+            bool target_valid = true;
             if (tbank > 0 && tbank != bank) {
-                if (!is_likely_valid_code(rom, tbank, target)) continue;
+                target_valid = is_likely_direct_branch_target(rom, tbank, target);
             }
 
-            result.call_targets.insert(make_address(tbank, target));
-            work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
-            
-            if (tbank != bank) {
-                result.stats.cross_bank_calls++;
-                result.bank_tracker.record_cross_bank_call(offset, target, bank, tbank);
+            if (target_valid) {
+                result.call_targets.insert(make_address(tbank, target));
+                result.strong_call_targets.insert(make_address(tbank, target));
+                work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, -1, tbank});
+
+                if (tbank != bank) {
+                    result.stats.cross_bank_calls++;
+                    result.bank_tracker.record_cross_bank_call(offset, target, bank, tbank);
+                }
             }
-            
+
             uint32_t fall_through = make_address(bank, offset + instr.length);
             result.label_addresses.insert(fall_through);
-            work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+            work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
         } else if (instr.is_jump) {
             if (instr.type == InstructionType::JP_NN || instr.type == InstructionType::JP_CC_NN) {
                 uint16_t target = instr.imm16;
                 uint8_t tbank = target_bank(target);
                 instr.resolved_target_bank = tbank;
-                if (target >= 0x4000 && target <= 0x7FFF) {
-                    if (tbank > 0 && tbank != bank) {
-                        if (!is_likely_valid_code(rom, tbank, target)) continue;
-                    }
-                    result.call_targets.insert(make_address(tbank, target));
+
+                bool target_valid = true;
+                if (target >= 0x4000 && target <= 0x7FFF &&
+                    tbank > 0 && tbank != bank) {
+                    target_valid = is_likely_direct_branch_target(rom, tbank, target);
                 }
-                result.label_addresses.insert(make_address(tbank, target));
-                work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, tbank});
+
+                if (target_valid) {
+                    if (target >= 0x4000 && target <= 0x7FFF) {
+                        result.call_targets.insert(make_address(tbank, target));
+                        result.strong_call_targets.insert(make_address(tbank, target));
+                    }
+                    result.label_addresses.insert(make_address(tbank, target));
+                    work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, tbank});
+                }
             } else if (instr.type == InstructionType::JR_N || instr.type == InstructionType::JR_CC_N) {
                 uint16_t target = offset + instr.length + instr.offset;
                 result.label_addresses.insert(make_address(bank, target));
-                work_queue.push({make_address(bank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push({make_address(bank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
             } else if (instr.type == InstructionType::JP_HL) {
                 int combined_hl = get_known_hl();
                 if (combined_hl != -1) {
@@ -797,8 +989,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     uint8_t tbank = target_bank(target);
                     std::cout << "[ANALYSIS] Resolved static JP HL at " << std::hex << (int)bank << ":" << offset << " -> " << (int)tbank << ":" << target << std::dec << "\n";
                     result.call_targets.insert(make_address(tbank, target));
+                    result.strong_call_targets.insert(make_address(tbank, target));
                     result.label_addresses.insert(make_address(tbank, target));
-                    work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, tbank});
+                    work_queue.push({make_address(tbank, target), known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, tbank});
                 } else {
                     // Backtracking Jump Table Heuristic
                     bool found_table = false;
@@ -819,7 +1012,8 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                                     uint8_t tbank = target_bank(target);
                                     if (is_likely_valid_code(rom, tbank, target)) {
                                         result.call_targets.insert(make_address(tbank, target));
-                                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, tbank});
+                                        result.strong_call_targets.insert(make_address(tbank, target));
+                                        work_queue.push({make_address(tbank, target), -1, -1, -1, -1, -1, -1, -1, -1, tbank});
                                         found_table = true;
                                     }
                                 }
@@ -834,16 +1028,16 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
                 result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
             }
         } else if (instr.is_return) {
             if (instr.is_conditional) {
                 uint32_t fall_through = make_address(bank, offset + instr.length);
                 result.label_addresses.insert(fall_through);
-                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+                work_queue.push({fall_through, known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
             }
         } else {
-            work_queue.push({make_address(bank, offset + instr.length), known_a, known_b, known_c, known_d, known_e, known_h, known_l, current_switchable_bank});
+            work_queue.push({make_address(bank, offset + instr.length), known_a, known_b, known_c, known_d, known_e, known_h, known_l, known_sp, current_switchable_bank});
         }
     } // End work_queue loop
 
@@ -896,10 +1090,11 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
                     // Add as a new entry point
                     uint32_t entry = make_address(bank, addr);
                     result.call_targets.insert(entry);
+                    result.strong_call_targets.insert(entry);
                     
                     // Add to queue
                     uint8_t context = (bank > 0) ? bank : 1;
-                    work_queue.push({entry, -1, -1, -1, -1, -1, -1, -1, context});
+                    work_queue.push({entry, -1, -1, -1, -1, -1, -1, -1, -1, context});
                     found_count++;
                     
                     // Mark region as scanned
@@ -1082,7 +1277,9 @@ AnalysisResult analyze(const ROM& rom, const AnalyzerOptions& options) {
             (func.entry_address >= 0x40 && func.entry_address <= 0x60) // interrupt vectors
         ));
         
-        if (total_instrs < MIN_FUNCTION_SIZE && !is_special_entry) {
+        if (total_instrs < MIN_FUNCTION_SIZE &&
+            !is_special_entry &&
+            !result.strong_call_targets.count(func_addr)) {
             functions_to_remove.insert(func_addr);
         }
     }

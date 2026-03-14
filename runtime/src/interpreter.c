@@ -720,5 +720,8 @@ void gb_interpret(GBContext* ctx, uint16_t addr) {
         
         /* Per-instruction cycle counting - uses table lookup + extra for branches taken */
         gb_tick(ctx, cycles + extra_cycles);
+        if (ctx->single_step_mode) {
+            return;
+        }
     }
 }

@@ -97,6 +97,10 @@ struct AnalysisResult {
     
     // Call targets (function entry points)
     std::set<uint32_t> call_targets;
+
+    // Entry points that must remain standalone callable functions.
+    // This excludes some synthetic targets used only for control-flow recovery.
+    std::set<uint32_t> strong_call_targets;
     
     // Computed jump targets (JP HL, etc.)
     std::set<uint32_t> computed_jump_targets;

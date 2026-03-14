@@ -357,31 +357,36 @@ void ppu_tick(GBPPU* ppu, GBContext* ctx, uint32_t cycles) {
     }
     
     ppu->mode_cycles += cycles;
-    
-    switch (ppu->mode) {
-        case PPU_MODE_OAM:
-            if (ppu->mode_cycles >= CYCLES_OAM_SCAN) {
+
+    for (;;) {
+        switch (ppu->mode) {
+            case PPU_MODE_OAM:
+                if (ppu->mode_cycles < CYCLES_OAM_SCAN) {
+                    return;
+                }
                 ppu->mode_cycles -= CYCLES_OAM_SCAN;
                 ppu->mode = PPU_MODE_DRAW;
                 update_stat(ppu, ctx);
-            }
-            break;
-            
-        case PPU_MODE_DRAW:
-            if (ppu->mode_cycles >= CYCLES_PIXEL_DRAW) {
+                break;
+                
+            case PPU_MODE_DRAW:
+                if (ppu->mode_cycles < CYCLES_PIXEL_DRAW) {
+                    return;
+                }
                 ppu->mode_cycles -= CYCLES_PIXEL_DRAW;
                 
-                /* Render the scanline */
+                /* Render the scanline once the pixel-transfer phase completes. */
                 ppu_render_scanline(ppu, ctx);
                 
                 ppu->mode = PPU_MODE_HBLANK;
                 update_stat(ppu, ctx);
                 check_stat_interrupt(ppu, ctx);
-            }
-            break;
-            
-        case PPU_MODE_HBLANK:
-            if (ppu->mode_cycles >= CYCLES_HBLANK) {
+                break;
+                
+            case PPU_MODE_HBLANK:
+                if (ppu->mode_cycles < CYCLES_HBLANK) {
+                    return;
+                }
                 ppu->mode_cycles -= CYCLES_HBLANK;
                 ppu->ly++;
                 
@@ -404,11 +409,12 @@ void ppu_tick(GBPPU* ppu, GBContext* ctx, uint32_t cycles) {
                 
                 update_stat(ppu, ctx);
                 check_stat_interrupt(ppu, ctx);
-            }
-            break;
-            
-        case PPU_MODE_VBLANK:
-            if (ppu->mode_cycles >= CYCLES_SCANLINE) {
+                break;
+                
+            case PPU_MODE_VBLANK:
+                if (ppu->mode_cycles < CYCLES_SCANLINE) {
+                    return;
+                }
                 ppu->mode_cycles -= CYCLES_SCANLINE;
                 ppu->ly++;
                 
@@ -422,8 +428,8 @@ void ppu_tick(GBPPU* ppu, GBContext* ctx, uint32_t cycles) {
                 
                 update_stat(ppu, ctx);
                 check_stat_interrupt(ppu, ctx);
-            }
-            break;
+                break;
+        }
     }
 }
 
@@ -461,13 +467,16 @@ void ppu_write_register(GBPPU* ppu, GBContext* ctx, uint16_t addr, uint8_t value
     
     switch (addr) {
         case 0xFF40:
+            {
+            uint8_t old_lcdc = ppu->lcdc;
             DBG_REGS("LCDC: 0x%02X -> 0x%02X (LCD=%s, BG=%s, OBJ=%s)", 
-                     ppu->lcdc, value,
+                     old_lcdc, value,
                      (value & 0x80) ? "ON" : "OFF",
                      (value & 0x01) ? "ON" : "OFF", 
                      (value & 0x02) ? "ON" : "OFF");
+            ppu->lcdc = value;
             /* Check if LCD is being turned off */
-            if ((ppu->lcdc & LCDC_LCD_ENABLE) && !(value & LCDC_LCD_ENABLE)) {
+            if ((old_lcdc & LCDC_LCD_ENABLE) && !(value & LCDC_LCD_ENABLE)) {
                 /* LCD turned off - reset to line 0 */
                 ppu->ly = 0;
                 ppu->window_line = 0;
@@ -477,10 +486,23 @@ void ppu_write_register(GBPPU* ppu, GBContext* ctx, uint16_t addr, uint8_t value
                 ctx->io[0x44] = 0;
                 /* Clear frame ready to avoid stale frame rendering */
                 ppu->frame_ready = false;
+                gbrt_note_lcd_transition(ctx, false, old_lcdc, value, ppu->ly, ppu->mode);
                 DBG_REGS("LCD turned OFF - reset LY to 0");
+            } else if (!(old_lcdc & LCDC_LCD_ENABLE) && (value & LCDC_LCD_ENABLE)) {
+                /* LCD turned on - restart from line 0, mode 2 */
+                ppu->ly = 0;
+                ppu->window_line = 0;
+                ppu->window_triggered = false;
+                ppu->mode = PPU_MODE_OAM;
+                ppu->mode_cycles = 0;
+                ppu->frame_ready = false;
+                ctx->io[0x44] = 0;
+                update_stat(ppu, ctx);
+                gbrt_note_lcd_transition(ctx, true, old_lcdc, value, ppu->ly, ppu->mode);
+                DBG_REGS("LCD turned ON - restart at LY 0 OAM");
             }
-            ppu->lcdc = value;
             break;
+            }
         case 0xFF41:
             /* Bits 0-2 are read-only */
             ppu->stat = (ppu->stat & 0x07) | (value & 0x78);

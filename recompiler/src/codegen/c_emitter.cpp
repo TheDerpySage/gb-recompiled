@@ -666,31 +666,35 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
             
         case ir::Opcode::STORE8:
             if (instr.dst.type == ir::OperandType::IMM16) {
-                const char* src_name = get_reg8_name(instr.src.value.reg8);
-                if (src_name) {
-                    out << "gb_write8(ctx, 0x" << std::hex << std::setfill('0') 
-                        << std::setw(4) << instr.dst.value.imm16 << std::dec 
-                        << ", ctx->" << src_name << ");\n";
-                } else if (instr.src.type == ir::OperandType::IMM8) {
+                if (instr.src.type == ir::OperandType::IMM8) {
                     out << "gb_write8(ctx, 0x" << std::hex << std::setfill('0') 
                         << std::setw(4) << instr.dst.value.imm16 << std::dec 
                         << ", 0x" << std::setw(2) << (int)instr.src.value.imm8 << ");\n";
                 } else {
-                    out << "gb_write8(ctx, 0x" << std::hex << std::setfill('0') 
-                        << std::setw(4) << instr.dst.value.imm16 << std::dec 
-                        << ", ctx->a);\n";
+                    const char* src_name = get_reg8_name(instr.src.value.reg8);
+                    if (src_name) {
+                        out << "gb_write8(ctx, 0x" << std::hex << std::setfill('0') 
+                            << std::setw(4) << instr.dst.value.imm16 << std::dec 
+                            << ", ctx->" << src_name << ");\n";
+                    } else {
+                        out << "gb_write8(ctx, 0x" << std::hex << std::setfill('0') 
+                            << std::setw(4) << instr.dst.value.imm16 << std::dec 
+                            << ", ctx->a);\n";
+                    }
                 }
             } else if (instr.dst.type == ir::OperandType::REG16) {
-                const char* src_name = get_reg8_name(instr.src.value.reg8);
-                if (src_name) {
-                    out << "gb_write8(ctx, ctx->" << reg16_names[instr.dst.value.reg16] 
-                        << ", ctx->" << src_name << ");\n";
-                } else if (instr.src.type == ir::OperandType::IMM8) {
+                if (instr.src.type == ir::OperandType::IMM8) {
                     out << "gb_write8(ctx, ctx->" << reg16_names[instr.dst.value.reg16] 
                         << ", 0x" << std::hex << std::setw(2) << (int)instr.src.value.imm8 << std::dec << ");\n";
                 } else {
-                    out << "gb_write8(ctx, ctx->" << reg16_names[instr.dst.value.reg16] 
-                        << ", ctx->a);\n";
+                    const char* src_name = get_reg8_name(instr.src.value.reg8);
+                    if (src_name) {
+                        out << "gb_write8(ctx, ctx->" << reg16_names[instr.dst.value.reg16] 
+                            << ", ctx->" << src_name << ");\n";
+                    } else {
+                        out << "gb_write8(ctx, ctx->" << reg16_names[instr.dst.value.reg16] 
+                            << ", ctx->a);\n";
+                    }
                 }
             }
             break;
@@ -864,6 +868,8 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                             out << "ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
                         }
                         emit_indent();
+                        out << "if (ctx->single_step_mode) return;\n";
+                        emit_indent();
                         out << "goto loc_" << std::hex << std::setfill('0') 
                             << std::setw(4) << target << std::dec << ";\n";
                     } else if (func_exists) {
@@ -873,6 +879,8 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                             emit_indent();
                         }
                         out << "ctx->pc = 0x" << std::hex << target << std::dec << ";\n";
+                        emit_indent();
+                        out << "if (ctx->single_step_mode) return;\n";
                         emit_indent();
                         
                         // Direct call
@@ -967,6 +975,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "    gb_tick(ctx, " << (int)instr.cycles_branch_taken << ");\n";
                         emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
+                    emit_indent(); out << "    if (ctx->single_step_mode) return;\n";
                     emit_indent(); out << "    goto loc_" << std::hex << std::setfill('0') 
                         << std::setw(4) << target << std::dec << ";\n";
                     emit_indent(); out << "} /* " << cond << " */\n";
@@ -978,6 +987,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "    gb_tick(ctx, " << (int)instr.cycles_branch_taken << ");\n";
                         emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
+                    emit_indent(); out << "    if (ctx->single_step_mode) return;\n";
                     
                     if (inlineable_functions.count(target_func)) {
                         // INLINE THE FUNCTION
@@ -1059,6 +1069,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                          emit_indent(); out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
                          emit_indent(); out << "if (ctx->stopped) return;\n";
                      }
+                     emit_indent(); out << "if (ctx->single_step_mode) return;\n";
 
                      out << "/* Inline: " << func_name << " */ {\n";
                     
@@ -1103,6 +1114,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
                         emit_indent(); out << "if (ctx->stopped) return;\n";
                     }
+                    emit_indent(); out << "if (ctx->single_step_mode) return;\n";
                     emit_indent();
                     if (func_exists) {
                         out << func_name << "(ctx);\n";
@@ -1150,6 +1162,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "    gb_tick(ctx, " << (int)taken_cycles << ");\n";
                         emit_indent(); out << "    if (ctx->stopped) return;\n";
                      }
+                     emit_indent(); out << "    if (ctx->single_step_mode) return;\n";
 
                      emit_indent(); out << "/* Inline: " << func_name << " */ {\n";
                     const auto& func = program.functions.at(func_name);
@@ -1184,6 +1197,7 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                         emit_indent(); out << "    gb_tick(ctx, " << (int)taken_cycles << ");\n";
                         emit_indent(); out << "    if (ctx->stopped) return;\n";
                     }
+                    emit_indent(); out << "    if (ctx->single_step_mode) return;\n";
                     if (func_exists) {
                         emit_indent(); out << "    " << func_name << "(ctx);\n";
                     }
@@ -1491,21 +1505,28 @@ static void emit_ir_instruction(std::ostream& out, const ir::IRInstruction& inst
                             instr.opcode == ir::Opcode::HALT ||
                             instr.opcode == ir::Opcode::STOP);
 
-    // Only emit PC update and cycle tick at BLOCK BOUNDARIES (not per-instruction)
-    // This batches cycle counting to reduce output size by ~35%
-    if (is_last_in_group && !is_control_flow) {
-        // Update PC only at block end for correct resumption
+    if (is_control_flow && is_last_in_group) {
+        emit_indent();
+        out << "if (ctx->single_step_mode) return;\n";
+    }
+
+    // In correctness mode, advance PC/timing after every non-control-flow instruction.
+    if (!is_control_flow) {
         if (next_pc_val != 0) {
             emit_indent();
             out << "ctx->pc = 0x" << std::hex << next_pc_val << std::dec << ";\n";
         }
-        
-        // Emit batched cycle tick only at block end
-        if (options.emit_cycle_counting && group_cycles > 0) {
+
+        if (options.emit_cycle_counting && instr.cycles > 0) {
             emit_indent();
-            out << "gb_tick(ctx, " << (int)group_cycles << ");\n";
+            out << "gb_tick(ctx, " << (int)instr.cycles << ");\n";
+        }
+
+        if (is_last_in_group) {
             emit_indent();
             out << "if (ctx->stopped) return;\n";
+            emit_indent();
+            out << "if (ctx->single_step_mode) return;\n";
         }
     }
 }
@@ -1527,127 +1548,132 @@ GeneratedOutput generate_output(const ir::Program& program,
     header_ss << "#endif\n";
     output.header_content = header_ss.str();
     output.header_file = options.output_prefix + ".h";
+    const std::string internal_header_file = options.output_prefix + "_internal.h";
+
+    std::ostringstream internal_header_ss;
+    internal_header_ss << "/* Generated by gbrecomp */\n";
+    internal_header_ss << "#ifndef " << options.output_prefix << "_INTERNAL_H\n";
+    internal_header_ss << "#define " << options.output_prefix << "_INTERNAL_H\n\n";
+    internal_header_ss << "#include \"" << options.output_prefix << ".h\"\n\n";
+    for (const auto& [name, func] : program.functions) {
+        internal_header_ss << "void " << func.name << "(GBContext* ctx);\n";
+    }
+    internal_header_ss << "\n#endif\n";
+    output.extra_files.push_back({
+        internal_header_file,
+        internal_header_ss.str(),
+        false,
+    });
     
     // Generate source
     std::ostringstream source_ss;
     source_ss << "/* Generated by gbrecomp from " << program.rom_name << " */\n";
-    source_ss << "#include \"" << options.output_prefix << ".h\"\n";
+    source_ss << "#include \"" << internal_header_file << "\"\n";
     source_ss << "#include \"gbrt.h\"\n";
     source_ss << "#include <stdio.h>\n";
     source_ss << "#include <stdlib.h>\n\n";
     
-    // Forward declarations
-    source_ss << "/* Forward declarations */\n";
-    for (const auto& [name, func] : program.functions) {
-        source_ss << "static void " << func.name << "(GBContext* ctx);\n";
-    }
-    source_ss << "\n";
-    
-    // Generate dispatch function for banked calls
+    // Generate dispatch after we resolve the reachable PC map.
     source_ss << "/* Bank dispatch - routes calls to the correct bank function */\n";
-    source_ss << "void gb_dispatch(GBContext* ctx, uint16_t addr) {\n";
-    source_ss << "    ctx->pc = addr;\n";
-    source_ss << "    while (!ctx->stopped && !ctx->halted) {\n";
-    source_ss << "        addr = ctx->pc;\n";
-    source_ss << "        uint8_t bank = ctx->rom_bank;\n";
-    source_ss << "        if (addr < 0x4000) bank = 0;\n";
-        
-    /* Debug checks in dispatch loop */
-    source_ss << "        if (gbrt_instruction_limit > 0 && gbrt_instruction_count >= gbrt_instruction_limit) {\n";
-    source_ss << "            fprintf(stderr, \"[LIMIT] Reached instruction limit %llu\\n\", (unsigned long long)gbrt_instruction_limit);\n";
-    source_ss << "            exit(0);\n";
-    source_ss << "        }\n";
-    source_ss << "        gbrt_instruction_count++;\n";
-    source_ss << "        \n";
-    source_ss << "        if (gbrt_trace_enabled) {\n";
-    source_ss << "            fprintf(stderr, \"[TRACE] Dispatch 0x%04X (Bank %d)\\n\", addr, bank);\n";
-    source_ss << "        }\n";
-
-    source_ss << "        switch (addr) {\n";
     
-    // Identify inlineable functions (Phase 4)
+    // Disable function inlining while correctness validation is being rebuilt.
     std::set<std::string> inlineable_functions;
-    for (const auto& [name, func] : program.functions) {
-        // Must be single block
-        if (func.block_ids.size() != 1) continue;
-        
-        // Block must be small (< 25 instructions) to ensure readability and avoid code bloat
-        const auto& block = program.blocks.at(func.block_ids[0]);
-        if (block.instructions.size() > 25) continue;
-        
-        // Must end in RET (unconditional)
-        if (block.instructions.empty()) continue;
-        const auto& last = block.instructions.back();
-        if (last.opcode != ir::Opcode::RET) continue;
-        
-        // Must NOT have internal control flow (CALL, JUMP*, RET_CC, etc)
-        // We only support linear sequences for simple inlining
-        bool safe_to_inline = true;
-        for (size_t i = 0; i < block.instructions.size() - 1; i++) { // Check all except last RET
-             const auto& op = block.instructions[i].opcode;
-             if (op == ir::Opcode::JUMP || op == ir::Opcode::JUMP_CC || op == ir::Opcode::JUMP_REG ||
-                 op == ir::Opcode::JR || op == ir::Opcode::JR_CC ||
-                 op == ir::Opcode::CALL || op == ir::Opcode::CALL_CC ||
-                 op == ir::Opcode::RET || op == ir::Opcode::RET_CC || op == ir::Opcode::RETI ||
-                 op == ir::Opcode::RST || op == ir::Opcode::STOP || op == ir::Opcode::HALT) {
-                 safe_to_inline = false;
-                 break;
-             }
-        }
-        if (!safe_to_inline) continue;
-        
-        // Exclude entry point and interrupt vectors
-        if (func.is_interrupt_handler || func.is_entry_point) continue;
-        
-        inlineable_functions.insert(func.name);
-    }
     
-    // Group functions by address for the switch statement
-    // Map every basic block start address to its function
+    // Group functions by address for the switch statement.
+    // In single-step mode we may re-enter at any instruction PC, not just block or function starts.
     struct DispatchEntry {
         uint8_t bank;
         std::string name;
+        uint16_t entry_address;
         bool is_entry;
         bool operator<(const DispatchEntry& o) const {
             if (bank != o.bank) return bank < o.bank;
-            if (is_entry != o.is_entry) return is_entry > o.is_entry; // true (entry) first
+            if (entry_address != o.entry_address) return entry_address > o.entry_address;
+            if (is_entry != o.is_entry) return is_entry > o.is_entry; // exact entry for this PC first
             return name < o.name;
         }
         bool operator==(const DispatchEntry& o) const {
-            return bank == o.bank && is_entry == o.is_entry; // Treat same bank/entry-status as equal for unique? NO.
-            // We want exact match for std::unique first.
-            // But wait, my manual unique below handles bank collisions.
-            return bank == o.bank && name == o.name && is_entry == o.is_entry;
+            return bank == o.bank &&
+                   name == o.name &&
+                   entry_address == o.entry_address &&
+                   is_entry == o.is_entry;
         }
     };
     std::map<uint16_t, std::vector<DispatchEntry>> addr_to_funcs;
 
     for (const auto& [name, func] : program.functions) {
-        // OPTIMIZATION: Only add function ENTRY points to dispatch table
-        // Internal basic blocks within functions are reached via goto labels
-        // This reduces dispatch table size by ~70%
-        addr_to_funcs[func.entry_address].push_back({func.bank, func.name, true});
+        std::set<uint16_t> function_pcs;
+        for (uint32_t block_id : func.block_ids) {
+            auto block_it = program.blocks.find(block_id);
+            if (block_it == program.blocks.end()) continue;
+            for (const auto& instr : block_it->second.instructions) {
+                if (instr.has_source_location) {
+                    function_pcs.insert(instr.source_address);
+                }
+            }
+        }
+
+        if (function_pcs.empty()) {
+            function_pcs.insert(func.entry_address);
+        }
+
+        for (uint16_t pc_addr : function_pcs) {
+            addr_to_funcs[pc_addr].push_back({
+                func.bank,
+                func.name,
+                func.entry_address,
+                pc_addr == func.entry_address,
+            });
+        }
     }
     
+    auto dispatch_page_name = [&](uint8_t page) {
+        std::ostringstream name_ss;
+        name_ss << options.output_prefix << "_dispatch_"
+                << std::hex << std::setfill('0') << std::setw(2) << (int)page
+                << std::dec;
+        return name_ss.str();
+    };
+
+    std::map<uint8_t, std::ostringstream> dispatch_page_sources;
     for (auto& [addr, funcs] : addr_to_funcs) {
         std::sort(funcs.begin(), funcs.end());
         funcs.erase(std::unique(funcs.begin(), funcs.end()), funcs.end());
-        
-        // Remove bank collisions (prefer entry)
-        auto last = std::unique(funcs.begin(), funcs.end(), [](const DispatchEntry& a, const DispatchEntry& b){
-            return a.bank == b.bank;
-        });
-        funcs.erase(last, funcs.end());
 
-        source_ss << "            case 0x" << std::hex << std::setfill('0') << std::setw(4) << addr << std::dec << ":\n";
-        // Check if bank validation is required (allocatable space >= 0x4000)
-        bool validation_needed = (addr >= 0x4000);
+        std::vector<DispatchEntry> resolved_funcs;
+        resolved_funcs.reserve(funcs.size());
+        for (const auto& entry : funcs) {
+            if (!resolved_funcs.empty() && resolved_funcs.back().bank == entry.bank) {
+                std::cerr << "[CODEGEN] Dispatch collision at "
+                          << std::hex << std::setfill('0') << std::setw(2) << (int)entry.bank
+                          << ":" << std::setw(4) << addr
+                          << std::dec << " resolved to " << resolved_funcs.back().name
+                          << " over " << entry.name << "\n";
+                continue;
+            }
+            resolved_funcs.push_back(entry);
+        }
+        funcs = std::move(resolved_funcs);
+
+        uint8_t page = static_cast<uint8_t>(addr >> 8);
+        auto& page_ss = dispatch_page_sources[page];
+        if (page_ss.tellp() == std::streampos(0)) {
+            page_ss << "void " << dispatch_page_name(page) << "(GBContext* ctx, uint16_t addr, uint8_t bank) {\n";
+            page_ss << "    switch (addr) {\n";
+        }
+
+        page_ss << "        case 0x" << std::hex << std::setfill('0') << std::setw(4)
+                << addr << std::dec << ":\n";
+        // Only the switchable ROM window is selected by the current ROM bank.
+        // RAM/HRAM overlays (e.g. OAM DMA stubs at 0xFF80) should not require
+        // bank validation when there is a single compiled implementation.
+        bool validation_needed = (addr >= 0x4000 && addr < 0x8000);
         
         if (funcs.size() == 1 && !validation_needed) {
             const auto& entry = funcs[0];
             if (inlineable_functions.count(entry.name)) {
                 // INLINE IN DISPATCH
-                source_ss << "                /* Inline: " << entry.name << " */ {\n";
+                page_ss << "            /* Inline: " << entry.name << " */ {\n";
                 const auto& func = program.functions.at(entry.name);
                 const auto& block = program.blocks.at(func.block_ids[0]);
                 
@@ -1657,27 +1683,27 @@ GeneratedOutput generate_output(const ir::Program& program,
                 uint32_t inline_cycles = 0;
                 for (size_t k = 0; k < limit; k++) {
                     inline_cycles += block.instructions[k].cycles;
-                    emit_ir_instruction(source_ss, block.instructions[k], program, 5, options, 0, 0, false, "", inlineable_functions);
+                    emit_ir_instruction(page_ss, block.instructions[k], program, 3, options, 0, 0, false, "", inlineable_functions);
                 }
                 if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
 
-                source_ss << "                    gb_ret(ctx);\n";
+                page_ss << "                gb_ret(ctx);\n";
 
                 if (options.emit_cycle_counting) {
-                     source_ss << "                    gb_tick(ctx, " << (int)inline_cycles << ");\n";
-                     source_ss << "                    if (ctx->stopped) return;\n";
+                     page_ss << "                gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                     page_ss << "                if (ctx->stopped) return;\n";
                 }
-                source_ss << "                } break;\n";
+                page_ss << "            } break;\n";
             } else {
-                source_ss << "                " << entry.name << "(ctx); break;\n";
+                page_ss << "            " << entry.name << "(ctx); break;\n";
             }
         } else {
-            source_ss << "                switch (bank) {\n";
+            page_ss << "            switch (bank) {\n";
             for (const auto& entry : funcs) {
                 if (inlineable_functions.count(entry.name)) {
                     // INLINE IN DISPATCH (BANKED)
-                    source_ss << "                    case " << (int)entry.bank << ": {\n";
-                    source_ss << "                        /* Inline: " << entry.name << " */\n";
+                    page_ss << "                case " << (int)entry.bank << ": {\n";
+                    page_ss << "                    /* Inline: " << entry.name << " */\n";
                     const auto& func = program.functions.at(entry.name);
                     const auto& block = program.blocks.at(func.block_ids[0]);
                     
@@ -1687,50 +1713,130 @@ GeneratedOutput generate_output(const ir::Program& program,
                     uint32_t inline_cycles = 0;
                     for (size_t k = 0; k < limit; k++) {
                         inline_cycles += block.instructions[k].cycles;
-                        emit_ir_instruction(source_ss, block.instructions[k], program, 6, options, 0, 0, false, "", inlineable_functions);
+                        emit_ir_instruction(page_ss, block.instructions[k], program, 5, options, 0, 0, false, "", inlineable_functions);
                     }
                     if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
 
-                    source_ss << "                        gb_ret(ctx);\n";
+                    page_ss << "                    gb_ret(ctx);\n";
 
                     if (options.emit_cycle_counting) {
-                         source_ss << "                        gb_tick(ctx, " << (int)inline_cycles << ");\n";
-                         source_ss << "                        if (ctx->stopped) return;\n";
+                         page_ss << "                    gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                         page_ss << "                    if (ctx->stopped) return;\n";
                     }
-                    source_ss << "                    } break;\n";
+                    page_ss << "                } break;\n";
                 } else {
-                    source_ss << "                    case " << (int)entry.bank << ": " << entry.name << "(ctx); break;\n";
+                    page_ss << "                case " << (int)entry.bank << ": " << entry.name << "(ctx); break;\n";
                 }
             }
-            source_ss << "                    default: gb_interpret(ctx, addr); break;\n";
-            source_ss << "                }\n";
-            source_ss << "                break;\n";
+            page_ss << "                default: gbrt_note_dispatch_fallback(ctx, bank, addr); gb_interpret(ctx, addr); break;\n";
+            page_ss << "            }\n";
+            page_ss << "            break;\n";
         }
     }
-    source_ss << "            default: gb_interpret(ctx, addr); break;\n";
+
+    const size_t dispatch_chunk_target_bytes = 4 * 1024 * 1024;
+    const std::string dispatch_chunk_preamble =
+        "/* Generated by gbrecomp from " + program.rom_name + " */\n"
+        "#include \"" + internal_header_file + "\"\n\n";
+    std::string current_dispatch_chunk = dispatch_chunk_preamble;
+    size_t dispatch_chunk_index = 0;
+    auto flush_dispatch_chunk = [&]() {
+        if (current_dispatch_chunk.size() <= dispatch_chunk_preamble.size()) {
+            return;
+        }
+        output.extra_files.push_back({
+            options.output_prefix + "_dispatch_chunk_" + std::to_string(dispatch_chunk_index++) + ".c",
+            current_dispatch_chunk,
+            true,
+        });
+        current_dispatch_chunk = dispatch_chunk_preamble;
+    };
+
+    for (const auto& [page, unused] : dispatch_page_sources) {
+        source_ss << "void " << dispatch_page_name(page) << "(GBContext* ctx, uint16_t addr, uint8_t bank);\n";
+    }
+    source_ss << "\n";
+
+    for (auto& [page, page_ss] : dispatch_page_sources) {
+        page_ss << "        default: gbrt_note_dispatch_fallback(ctx, bank, addr); gb_interpret(ctx, addr); break;\n";
+        page_ss << "    }\n";
+        page_ss << "}\n\n";
+        const std::string page_source = page_ss.str();
+        if (current_dispatch_chunk.size() + page_source.size() > dispatch_chunk_target_bytes) {
+            flush_dispatch_chunk();
+        }
+        current_dispatch_chunk += page_source;
+    }
+    flush_dispatch_chunk();
+
+    source_ss << "void gb_dispatch(GBContext* ctx, uint16_t addr) {\n";
+    source_ss << "    ctx->pc = addr;\n";
+    source_ss << "    while (!ctx->stopped && !ctx->halted) {\n";
+    source_ss << "        addr = ctx->pc;\n";
+    source_ss << "        uint8_t bank = ctx->rom_bank;\n";
+    source_ss << "        if (addr < 0x4000) bank = 0;\n";
+    source_ss << "        if (gbrt_instruction_limit > 0 && gbrt_instruction_count >= gbrt_instruction_limit) {\n";
+    source_ss << "            fprintf(stderr, \"[LIMIT] Reached instruction limit %llu\\n\", (unsigned long long)gbrt_instruction_limit);\n";
+    source_ss << "            exit(0);\n";
     source_ss << "        }\n";
+    source_ss << "        gbrt_instruction_count++;\n";
+    source_ss << "        if (gbrt_trace_enabled) {\n";
+    source_ss << "            fprintf(stderr, \"[TRACE] Dispatch 0x%04X (Bank %d)\\n\", addr, bank);\n";
+    source_ss << "        }\n";
+    source_ss << "        if (gbrt_try_execute_hram_stub(ctx, addr)) {\n";
+    source_ss << "            if (ctx->single_step_mode) break;\n";
+    source_ss << "            continue;\n";
+    source_ss << "        }\n";
+    source_ss << "        switch (addr >> 8) {\n";
+    for (const auto& [page, unused] : dispatch_page_sources) {
+        source_ss << "            case 0x" << std::hex << std::setfill('0') << std::setw(2)
+                  << (int)page << std::dec << ": "
+                  << dispatch_page_name(page) << "(ctx, addr, bank); break;\n";
+    }
+    source_ss << "            default: gbrt_note_dispatch_fallback(ctx, bank, addr); gb_interpret(ctx, addr); break;\n";
+    source_ss << "        }\n";
+    source_ss << "        if (ctx->single_step_mode) break;\n";
     source_ss << "    }\n";
     source_ss << "}\n\n";
-    
+
     source_ss << "void gb_dispatch_call(GBContext* ctx, uint16_t addr) {\n";
     source_ss << "    gb_dispatch(ctx, addr);\n";
     source_ss << "}\n\n";
     
-    // Emit each function with real IR code
+    const size_t chunk_target_bytes = 4 * 1024 * 1024;
+    const std::string chunk_preamble =
+        "/* Generated by gbrecomp from " + program.rom_name + " */\n"
+        "#include \"" + internal_header_file + "\"\n\n";
+    std::string current_chunk = chunk_preamble;
+    size_t chunk_index = 0;
+    auto flush_chunk = [&]() {
+        if (current_chunk.size() <= chunk_preamble.size()) {
+            return;
+        }
+        output.extra_files.push_back({
+            options.output_prefix + "_funcs_" + std::to_string(chunk_index++) + ".c",
+            current_chunk,
+            true,
+        });
+        current_chunk = chunk_preamble;
+    };
+
+    // Emit each function with real IR code into chunked source files.
     for (const auto& [name, func] : program.functions) {
         if (inlineable_functions.count(func.name)) {
             continue; // Skip inlined functions
         }
-        source_ss << "/* Function at ";
+
+        std::ostringstream func_ss;
+        func_ss << "/* Function at ";
         if (func.bank > 0) {
-            source_ss << std::hex << std::setfill('0') << std::setw(2) << (int)func.bank << ":";
+            func_ss << std::hex << std::setfill('0') << std::setw(2) << (int)func.bank << ":";
         }
-        source_ss << std::hex << std::setfill('0') << std::setw(4) << func.entry_address << std::dec << " */\n";
-        source_ss << "static void " << func.name << "(GBContext* ctx) {\n";
-        
-        // Sort block_ids by their start address to ensure proper fallthrough order
+        func_ss << std::hex << std::setfill('0') << std::setw(4) << func.entry_address << std::dec << " */\n";
+        func_ss << "void " << func.name << "(GBContext* ctx) {\n";
+
         std::vector<uint32_t> sorted_block_ids = func.block_ids;
-        std::sort(sorted_block_ids.begin(), sorted_block_ids.end(), 
+        std::sort(sorted_block_ids.begin(), sorted_block_ids.end(),
             [&program](uint32_t a, uint32_t b) {
                 auto it_a = program.blocks.find(a);
                 auto it_b = program.blocks.find(b);
@@ -1738,168 +1844,194 @@ GeneratedOutput generate_output(const ir::Program& program,
                 if (it_b == program.blocks.end()) return true;
                 return it_a->second.start_address < it_b->second.start_address;
             });
-            
-        // Emit computed goto for entry into the correct block
-        source_ss << "    switch (ctx->pc) {\n";
+
+        std::set<uint16_t> dispatchable_pcs;
         for (uint32_t block_id : sorted_block_ids) {
             auto it = program.blocks.find(block_id);
-            if (it != program.blocks.end()) {
-                source_ss << "        case 0x" << std::hex << std::setfill('0') << std::setw(4) 
-                          << it->second.start_address << std::dec << ": goto loc_" 
-                          << std::hex << std::setfill('0') << std::setw(4) 
-                          << it->second.start_address << std::dec << ";\n";
+            if (it == program.blocks.end()) continue;
+            for (const auto& instr : it->second.instructions) {
+                if (instr.has_source_location) {
+                    dispatchable_pcs.insert(instr.source_address);
+                }
             }
         }
-        source_ss << "        default: break;\n";
-        source_ss << "    }\n\n";
-        
-        // Emit each block in this function (now sorted by address)
+
+        func_ss << "    switch (ctx->pc) {\n";
+        for (uint16_t pc_addr : dispatchable_pcs) {
+            func_ss << "        case 0x" << std::hex << std::setfill('0') << std::setw(4)
+                    << pc_addr << std::dec << ": goto pc_"
+                    << std::hex << std::setfill('0') << std::setw(4)
+                    << pc_addr << std::dec << ";\n";
+        }
+        func_ss << "        default: break;\n";
+        func_ss << "    }\n\n";
+
+        std::set<uint16_t> emitted_pc_labels;
         for (size_t block_idx = 0; block_idx < sorted_block_ids.size(); block_idx++) {
             uint32_t block_id = sorted_block_ids[block_idx];
             auto block_it = program.blocks.find(block_id);
             if (block_it == program.blocks.end()) continue;
             const ir::BasicBlock& block = block_it->second;
-            
-            // Generate label from block address
-            source_ss << "loc_" << std::hex << std::setfill('0') << std::setw(4) 
-                      << block.start_address << std::dec << ":\n";
-            
-            // Calculate total cycles for this basic block upfront (for batched counting)
-            uint32_t block_total_cycles = 0;
-            for (const auto& ir_instr : block.instructions) {
-                block_total_cycles += ir_instr.cycles;
-            }
-            
-            // Emit each IR instruction
+
+            func_ss << "loc_" << std::hex << std::setfill('0') << std::setw(4)
+                    << block.start_address << std::dec << ":\n";
+
             for (size_t i = 0; i < block.instructions.size(); ++i) {
                 const auto& ir_instr = block.instructions[i];
-                
+
+                if (ir_instr.has_source_location &&
+                    emitted_pc_labels.insert(ir_instr.source_address).second) {
+                    func_ss << "pc_" << std::hex << std::setfill('0') << std::setw(4)
+                            << ir_instr.source_address << std::dec << ":\n";
+                }
+
                 uint16_t next_pc = 0;
                 bool is_last_in_block = (i + 1 >= block.instructions.size());
-                
-                // Calculate next PC
+                bool is_last_in_group = is_last_in_block;
+
                 if (i + 1 < block.instructions.size()) {
-                    next_pc = block.instructions[i+1].source_address;
+                    next_pc = block.instructions[i + 1].source_address;
+                    const auto& next_ir = block.instructions[i + 1];
+                    is_last_in_group =
+                        !next_ir.has_source_location ||
+                        !ir_instr.has_source_location ||
+                        next_ir.source_bank != ir_instr.source_bank ||
+                        next_ir.source_address != ir_instr.source_address;
                 } else {
                     next_pc = block.end_address;
                 }
-                
-                // Only emit cycles at block boundaries (not per-instruction)
-                // Pass total block cycles only for the last instruction
-                uint32_t cycles_to_pass = is_last_in_block ? block_total_cycles : 0;
-                
-                emit_ir_instruction(source_ss, ir_instr, program, 1, options, next_pc, cycles_to_pass, is_last_in_block, func.name, inlineable_functions);
+
+                emit_ir_instruction(func_ss,
+                                    ir_instr,
+                                    program,
+                                    1,
+                                    options,
+                                    next_pc,
+                                    ir_instr.cycles,
+                                    is_last_in_group,
+                                    func.name,
+                                    inlineable_functions);
             }
-            
-            // Check if block falls through
+
             bool falls_through = true;
             uint16_t fallthrough_addr = block.end_address;
-            
-            // Find the last non-NOP instruction
             for (auto it = block.instructions.rbegin(); it != block.instructions.rend(); ++it) {
                 if (it->opcode == ir::Opcode::NOP) continue;
-                
-                // Unconditional terminators do not fall through
-                if (it->opcode == ir::Opcode::JUMP || 
-                    it->opcode == ir::Opcode::RET) {
+                if (it->opcode == ir::Opcode::JUMP || it->opcode == ir::Opcode::RET) {
                     falls_through = false;
                 }
                 break;
             }
-            
+
             bool next_is_fallthrough = false;
             if (block_idx + 1 < sorted_block_ids.size()) {
                 uint32_t next_id = sorted_block_ids[block_idx + 1];
                 auto next_it = program.blocks.find(next_id);
-                if (next_it != program.blocks.end()) {
-                    if (next_it->second.start_address == fallthrough_addr) {
-                        next_is_fallthrough = true;
-                    }
+                if (next_it != program.blocks.end() &&
+                    next_it->second.start_address == fallthrough_addr) {
+                    next_is_fallthrough = true;
                 }
             }
-            
+
             if (falls_through && !next_is_fallthrough) {
-                    // Debug specific function 27eb
+                if (func.name == "func_27eb") {
+                    std::cerr << "DEBUG: found func_27eb falling through to 0x"
+                              << std::hex << fallthrough_addr << std::dec << "\n";
+                }
+
+                bool fallthrough_exists_in_function = false;
+                for (uint32_t fn_block_id : sorted_block_ids) {
+                    auto fn_block_it = program.blocks.find(fn_block_id);
+                    if (fn_block_it != program.blocks.end() &&
+                        fn_block_it->second.start_address == fallthrough_addr) {
+                        fallthrough_exists_in_function = true;
+                        break;
+                    }
+                }
+
+                if (fallthrough_exists_in_function) {
+                    func_ss << "    goto loc_" << std::hex << std::setfill('0')
+                            << std::setw(4) << fallthrough_addr << std::dec
+                            << "; /* fallthrough */\n";
+                } else {
                     if (func.name == "func_27eb") {
-                        std::cerr << "DEBUG: found func_27eb falling through to 0x" << std::hex << fallthrough_addr << std::dec << "\n";
+                        std::cerr << "DEBUG: func_27eb fallthrough not in function. Searching targets...\n";
                     }
 
-                    // Check if fallthrough target exists as a block in this function
-                    bool fallthrough_exists_in_function = false;
-                    for (uint32_t fn_block_id : sorted_block_ids) {
-                        auto fn_block_it = program.blocks.find(fn_block_id);
-                        if (fn_block_it != program.blocks.end() && 
-                            fn_block_it->second.start_address == fallthrough_addr) {
-                            fallthrough_exists_in_function = true;
+                    bool found_target_func = false;
+                    for (const auto& kv : program.functions) {
+                        const ir::Function& target_func = kv.second;
+                        if (target_func.bank == func.bank &&
+                            target_func.entry_address == fallthrough_addr) {
+                            func_ss << "    /* fallthrough to function */\n";
+
+                            if (inlineable_functions.count(target_func.name)) {
+                                func_ss << "    /* Inline: " << target_func.name << " */ {\n";
+                                const auto& block = program.blocks.at(target_func.block_ids[0]);
+
+                                size_t limit = block.instructions.size();
+                                if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) {
+                                    limit--;
+                                }
+
+                                uint32_t inline_cycles = 0;
+                                for (size_t k = 0; k < limit; k++) {
+                                    inline_cycles += block.instructions[k].cycles;
+                                    emit_ir_instruction(func_ss,
+                                                        block.instructions[k],
+                                                        program,
+                                                        2,
+                                                        options,
+                                                        0,
+                                                        0,
+                                                        false,
+                                                        "",
+                                                        inlineable_functions);
+                                }
+                                if (block.instructions.size() > limit) {
+                                    inline_cycles += block.instructions.back().cycles;
+                                }
+
+                                func_ss << "        gb_ret(ctx);\n";
+
+                                if (options.emit_cycle_counting) {
+                                    func_ss << "        gb_tick(ctx, " << (int)inline_cycles << ");\n";
+                                    func_ss << "        if (ctx->stopped) return;\n";
+                                }
+                                func_ss << "    } /* End Inline */\n";
+                            } else {
+                                func_ss << "    " << target_func.name << "(ctx);\n";
+                            }
+                            func_ss << "    return;\n";
+                            found_target_func = true;
+                            if (func.name == "func_27eb") {
+                                std::cerr << "DEBUG: Found target: " << target_func.name << "\n";
+                            }
                             break;
                         }
                     }
-                    
-                    // Only emit goto if the target block exists in this function
-                    if (fallthrough_exists_in_function) {
-                        // Emit explicit goto to fallthrough block
-                        source_ss << "    goto loc_" << std::hex << std::setfill('0') 
-                                  << std::setw(4) << fallthrough_addr << std::dec 
-                                  << "; /* fallthrough */\n";
-                    } else {
+
+                    if (!found_target_func) {
                         if (func.name == "func_27eb") {
-                             std::cerr << "DEBUG: func_27eb fallthrough not in function. Searching targets...\n";
+                            std::cerr << "DEBUG: No target function found for 0x"
+                                      << std::hex << fallthrough_addr << std::dec << "\n";
                         }
-                        // Fallthrough to another function?
-                        // Check if any function starts at fallthrough_addr in the same bank
-                        bool found_target_func = false;
-                        for (const auto& kv : program.functions) {
-                            const ir::Function& target_func = kv.second;
-                            if (target_func.bank == func.bank && target_func.entry_address == fallthrough_addr) {
-                                source_ss << "    /* fallthrough to function */\n";
-                                
-                                if (inlineable_functions.count(target_func.name)) {
-                                    // INLINE FALLTHROUGH
-                                    source_ss << "    /* Inline: " << target_func.name << " */ {\n";
-                                    const auto& block = program.blocks.at(target_func.block_ids[0]);
-                                    
-                                    size_t limit = block.instructions.size();
-                                    if (limit > 0 && block.instructions.back().opcode == ir::Opcode::RET) limit--;
-                                    
-                                    uint32_t inline_cycles = 0;
-                                    for (size_t k = 0; k < limit; k++) {
-                                        inline_cycles += block.instructions[k].cycles;
-                                        emit_ir_instruction(source_ss, block.instructions[k], program, 2, options, 0, 0, false, "", inlineable_functions);
-                                    }
-                                    if (block.instructions.size() > limit) inline_cycles += block.instructions.back().cycles;
-
-                                    source_ss << "        gb_ret(ctx);\n";
-
-                                    if (options.emit_cycle_counting) {
-                                         source_ss << "        gb_tick(ctx, " << (int)inline_cycles << ");\n";
-                                         source_ss << "        if (ctx->stopped) return;\n";
-                                    }
-                                    source_ss << "    } /* End Inline */\n";
-                                } else {
-                                    source_ss << "    " << target_func.name << "(ctx);\n";
-                                }
-                                source_ss << "    return;\n";
-                                found_target_func = true;
-                                if (func.name == "func_27eb") std::cerr << "DEBUG: Found target: " << target_func.name << "\n";
-                                break;
-                            }
-                        }
-                        
-                        if (!found_target_func) {
-                            if (func.name == "func_27eb") std::cerr << "DEBUG: No target function found for 0x" << std::hex << fallthrough_addr << std::dec << "\n";
-                            source_ss << "    /* warning: fallthrough to unanalyzed code at 0x" 
-                                      << std::hex << fallthrough_addr << std::dec << " in bank " << (int)func.bank << " */\n";
-                            
-                            source_ss << "    return;\n";
-                        }
+                        func_ss << "    /* warning: fallthrough to unanalyzed code at 0x"
+                                << std::hex << fallthrough_addr << std::dec
+                                << " in bank " << (int)func.bank << " */\n";
+                        func_ss << "    return;\n";
                     }
-
+                }
             }
         }
-        
-        // If function is empty or has no terminator, add a return
-        source_ss << "}\n\n";
+
+        func_ss << "}\n\n";
+        if (current_chunk.size() + func_ss.str().size() > chunk_target_bytes) {
+            flush_chunk();
+        }
+        current_chunk += func_ss.str();
     }
+    flush_chunk();
     
     // Extern reference to ROM data
     source_ss << "/* Extern reference to ROM data */\n";
@@ -1948,17 +2080,75 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "#include \"audio.h\"\n";
     main_ss << "#include \"audio_stats.h\"\n";
     main_ss << "#ifdef GB_HAS_SDL2\n";
+    main_ss << "#include <SDL.h>\n";
     main_ss << "#include \"platform_sdl.h\"\n";
     main_ss << "#endif\n";
     main_ss << "#include <stdio.h>\n";
-    main_ss << "#include <stdio.h>\n";
     main_ss << "#include <stdlib.h>\n";
-    main_ss << "#include <string.h>\n\n";
+    main_ss << "#include <string.h>\n";
+    main_ss << "#ifdef _WIN32\n";
+    main_ss << "#include <io.h>\n";
+    main_ss << "#define GB_DUP2 _dup2\n";
+    main_ss << "#define GB_FILENO _fileno\n";
+    main_ss << "#else\n";
+    main_ss << "#include <unistd.h>\n";
+    main_ss << "#define GB_DUP2 dup2\n";
+    main_ss << "#define GB_FILENO fileno\n";
+    main_ss << "#endif\n\n";
+    main_ss << "static bool gb_redirect_logs(const char* path) {\n";
+    main_ss << "    if (!path || !path[0]) {\n";
+    main_ss << "        return true;\n";
+    main_ss << "    }\n";
+    main_ss << "    if (!freopen(path, \"w\", stdout)) {\n";
+    main_ss << "        fprintf(stderr, \"Failed to open log file '%s' for stdout redirection\\n\", path);\n";
+    main_ss << "        return false;\n";
+    main_ss << "    }\n";
+    main_ss << "    if (GB_DUP2(GB_FILENO(stdout), GB_FILENO(stderr)) < 0) {\n";
+    main_ss << "        fprintf(stdout, \"Failed to open log file '%s' for stderr redirection\\n\", path);\n";
+    main_ss << "        fflush(stdout);\n";
+    main_ss << "        return false;\n";
+    main_ss << "    }\n";
+    main_ss << "    setvbuf(stdout, NULL, _IONBF, 0);\n";
+    main_ss << "    setvbuf(stderr, NULL, _IONBF, 0);\n";
+    main_ss << "    fprintf(stderr, \"[LOG] Redirecting runtime output to %s\\n\", path);\n";
+    main_ss << "    return true;\n";
+    main_ss << "}\n\n";
+    main_ss << "#ifdef GB_HAS_SDL2\n";
+    main_ss << "static double gb_profile_now_ms(void) {\n";
+    main_ss << "    uint64_t ticks = SDL_GetPerformanceCounter();\n";
+    main_ss << "    uint64_t freq = SDL_GetPerformanceFrequency();\n";
+    main_ss << "    return freq ? ((double)ticks * 1000.0) / (double)freq : 0.0;\n";
+    main_ss << "}\n";
+    main_ss << "#endif\n\n";
     main_ss << "int main(int argc, char* argv[]) {\n";
     main_ss << "    bool debug_audio = false;\n";
     main_ss << "    bool debug_audio_trace = false;\n";
     main_ss << "    bool audio_stats_console = false;\n";
     main_ss << "    unsigned debug_audio_seconds = 10;\n";
+    main_ss << "    bool differential_mode = false;\n";
+    main_ss << "    unsigned long long differential_steps = 10000;\n";
+    main_ss << "    bool differential_steps_explicit = false;\n";
+    main_ss << "    unsigned long long differential_frames = 0;\n";
+    main_ss << "    unsigned long long differential_log_interval = 1000;\n";
+    main_ss << "    bool differential_compare_memory = true;\n";
+    main_ss << "    bool differential_log_fallbacks = false;\n";
+    main_ss << "    bool differential_fail_on_fallback = false;\n";
+    main_ss << "    bool debug_performance = false;\n";
+    main_ss << "    const char* input_script = NULL;\n";
+    main_ss << "    const char* log_file = NULL;\n";
+    main_ss << "    double slow_frame_ms = 0.0;\n";
+    main_ss << "    double slow_vsync_ms = 0.0;\n";
+    main_ss << "    bool log_frame_fallbacks = false;\n";
+    main_ss << "    bool log_lcd_transitions = false;\n";
+    main_ss << "    int smooth_lcd_transitions_override = -1;\n";
+    main_ss << "    for (int i = 1; i < argc; i++) {\n";
+    main_ss << "        if (strcmp(argv[i], \"--log-file\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            log_file = argv[++i];\n";
+    main_ss << "        }\n";
+    main_ss << "    }\n";
+    main_ss << "    if (!gb_redirect_logs(log_file)) {\n";
+    main_ss << "        return 1;\n";
+    main_ss << "    }\n";
     main_ss << "    // Parse args\n";
     main_ss << "    for (int i = 1; i < argc; i++) {\n";
     main_ss << "        if (strcmp(argv[i], \"--trace\") == 0) {\n";
@@ -1970,11 +2160,18 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "            gbrt_instruction_limit = strtoull(argv[++i], NULL, 10);\n";
     main_ss << "            printf(\"Instruction limit: %llu\\n\", (unsigned long long)gbrt_instruction_limit);\n";
     main_ss << "        } else if (strcmp(argv[i], \"--input\") == 0 && i + 1 < argc) {\n";
-    main_ss << "            gb_platform_set_input_script(argv[++i]);\n";
+    main_ss << "            input_script = argv[++i];\n";
+    main_ss << "            gb_platform_set_input_script(input_script);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--record-input\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            gb_platform_set_input_record_file(argv[++i]);\n";
     main_ss << "        } else if (strcmp(argv[i], \"--dump-frames\") == 0 && i + 1 < argc) {\n";
     main_ss << "            gb_platform_set_dump_frames(argv[++i]);\n";
     main_ss << "        } else if (strcmp(argv[i], \"--screenshot-prefix\") == 0 && i + 1 < argc) {\n";
     main_ss << "            gb_platform_set_screenshot_prefix(argv[++i]);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--log-file\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            i++;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--debug-performance\") == 0) {\n";
+    main_ss << "            debug_performance = true;\n";
     main_ss << "        } else if (strcmp(argv[i], \"--debug-audio\") == 0) {\n";
     main_ss << "            debug_audio = true;\n";
     main_ss << "        } else if (strcmp(argv[i], \"--debug-audio-seconds\") == 0 && i + 1 < argc) {\n";
@@ -1983,13 +2180,83 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "            debug_audio_trace = true;\n";
     main_ss << "        } else if (strcmp(argv[i], \"--audio-stats\") == 0) {\n";
     main_ss << "            audio_stats_console = true;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--log-slow-frames\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            slow_frame_ms = strtod(argv[++i], NULL);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--log-slow-vsync\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            slow_vsync_ms = strtod(argv[++i], NULL);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--log-frame-fallbacks\") == 0) {\n";
+    main_ss << "            log_frame_fallbacks = true;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--log-lcd-transitions\") == 0) {\n";
+    main_ss << "            log_lcd_transitions = true;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--smooth-lcd-transitions\") == 0) {\n";
+    main_ss << "            smooth_lcd_transitions_override = 1;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--no-smooth-lcd-transitions\") == 0) {\n";
+    main_ss << "            smooth_lcd_transitions_override = 0;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential\") == 0) {\n";
+    main_ss << "            differential_mode = true;\n";
+    main_ss << "            if (i + 1 < argc && argv[i + 1][0] != '-') {\n";
+    main_ss << "                differential_steps = strtoull(argv[++i], NULL, 10);\n";
+    main_ss << "                differential_steps_explicit = true;\n";
+    main_ss << "            }\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential-frames\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            differential_frames = strtoull(argv[++i], NULL, 10);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential-log\") == 0 && i + 1 < argc) {\n";
+    main_ss << "            differential_log_interval = strtoull(argv[++i], NULL, 10);\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential-no-memory\") == 0) {\n";
+    main_ss << "            differential_compare_memory = false;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential-log-fallbacks\") == 0) {\n";
+    main_ss << "            differential_log_fallbacks = true;\n";
+    main_ss << "        } else if (strcmp(argv[i], \"--differential-fail-on-fallback\") == 0) {\n";
+    main_ss << "            differential_fail_on_fallback = true;\n";
     main_ss << "        }\n";
     main_ss << "    }\n\n";
+    main_ss << "    if (debug_performance) {\n";
+    main_ss << "        audio_stats_console = true;\n";
+    main_ss << "        log_frame_fallbacks = true;\n";
+    main_ss << "        log_lcd_transitions = true;\n";
+    main_ss << "        if (slow_frame_ms <= 0.0) slow_frame_ms = 1.0;\n";
+    main_ss << "        if (slow_vsync_ms <= 0.0) slow_vsync_ms = 0.1;\n";
+    main_ss << "        fprintf(stderr,\n";
+    main_ss << "                \"[PERF] Enabled performance debug logging (frame>=%.3fms, vsync>=%.3fms, fallbacks, LCD transitions, audio stats)\\n\",\n";
+    main_ss << "                slow_frame_ms,\n";
+    main_ss << "                slow_vsync_ms);\n";
+    main_ss << "    }\n\n";
+    main_ss << "    if (differential_mode && differential_frames > 0 && !differential_steps_explicit) {\n";
+    main_ss << "        differential_steps = 0;\n";
+    main_ss << "    }\n\n";
+    main_ss << "    if (differential_mode) {\n";
+    main_ss << "        GBContext* generated_ctx = gb_context_create(NULL);\n";
+    main_ss << "        GBContext* interpreted_ctx = gb_context_create(NULL);\n";
+    main_ss << "        if (!generated_ctx || !interpreted_ctx) {\n";
+    main_ss << "            fprintf(stderr, \"Failed to create differential contexts\\n\");\n";
+    main_ss << "            gb_context_destroy(generated_ctx);\n";
+    main_ss << "            gb_context_destroy(interpreted_ctx);\n";
+    main_ss << "            return 1;\n";
+    main_ss << "        }\n";
+    main_ss << "        " << options.output_prefix << "_init(generated_ctx);\n";
+    main_ss << "        " << options.output_prefix << "_init(interpreted_ctx);\n";
+    main_ss << "        GBDifferentialOptions diff_options = {\n";
+    main_ss << "            .max_steps = differential_steps,\n";
+    main_ss << "            .max_frames = differential_frames,\n";
+    main_ss << "            .log_interval = differential_log_interval,\n";
+    main_ss << "            .compare_memory = differential_compare_memory,\n";
+    main_ss << "            .log_fallbacks = differential_log_fallbacks,\n";
+    main_ss << "            .fail_on_fallback = differential_fail_on_fallback,\n";
+    main_ss << "            .input_script = input_script,\n";
+    main_ss << "        };\n";
+    main_ss << "        GBDifferentialResult diff_result;\n";
+    main_ss << "        bool matched = gb_run_differential(generated_ctx, interpreted_ctx, &diff_options, &diff_result);\n";
+    main_ss << "        gb_context_destroy(generated_ctx);\n";
+    main_ss << "        gb_context_destroy(interpreted_ctx);\n";
+    main_ss << "        return matched ? 0 : 1;\n";
+    main_ss << "    }\n";
+    main_ss << "\n";
     main_ss << "    GBContext* ctx = gb_context_create(NULL);\n";
     main_ss << "    if (!ctx) {\n";
     main_ss << "        fprintf(stderr, \"Failed to create context\\n\");\n";
     main_ss << "        return 1;\n";
     main_ss << "    }\n";
+    main_ss << "    gbrt_log_lcd_transitions = log_lcd_transitions;\n";
     main_ss << "    if (debug_audio) gb_audio_set_debug(true);\n";
     main_ss << "    gb_audio_set_debug_capture_seconds(debug_audio_seconds);\n";
     main_ss << "    if (debug_audio_trace) gb_audio_set_debug_trace(true);\n";
@@ -2004,17 +2271,99 @@ GeneratedOutput generate_output(const ir::Program& program,
     main_ss << "        return 1;\n";
     main_ss << "    }\n";
     main_ss << "    gb_platform_register_context(ctx);\n";
+    main_ss << "    if (smooth_lcd_transitions_override >= 0) {\n";
+    main_ss << "        gb_platform_set_smooth_lcd_transitions(smooth_lcd_transitions_override != 0);\n";
+    main_ss << "    }\n";
     main_ss << "\n";
     main_ss << "    // Run the game loop\n";
-    main_ss << "    while (1) {\n";
-    main_ss << "        gb_run_frame(ctx);\n";
-    main_ss << "        if (!gb_platform_poll_events(ctx)) break;\n";
+    main_ss << "    unsigned long long frame_index = 0;\n";
+    main_ss << "    const uint32_t lcd_smooth_slice_cycles = 70224u;\n";
+    main_ss << "    bool running = true;\n";
+    main_ss << "    while (running) {\n";
+    main_ss << "        double emu_ms = 0.0;\n";
+    main_ss << "        double render_ms = 0.0;\n";
+    main_ss << "        double upload_ms = 0.0;\n";
+    main_ss << "        double compose_ms = 0.0;\n";
+    main_ss << "        double present_ms = 0.0;\n";
+    main_ss << "        double vsync_ms = 0.0;\n";
+    main_ss << "        uint32_t paced_cycles = 0;\n";
+    main_ss << "        GBPlatformTimingInfo timing_info = {0};\n";
+    main_ss << "        gb_reset_frame(ctx);\n";
+    main_ss << "        ctx->stopped = 0;\n";
+    main_ss << "        while (!ctx->frame_done) {\n";
+    main_ss << "            bool smooth_lcd_transitions = gb_platform_get_smooth_lcd_transitions();\n";
+    main_ss << "            uint32_t slice_budget = smooth_lcd_transitions ? lcd_smooth_slice_cycles : 0xFFFFFFFFu;\n";
+    main_ss << "            uint32_t slice_start_cycles = ctx->frame_cycles;\n";
+    main_ss << "            double slice_start_ms = gb_profile_now_ms();\n";
+    main_ss << "            gb_run_cycles(ctx, slice_budget);\n";
+    main_ss << "            emu_ms += gb_profile_now_ms() - slice_start_ms;\n";
+    main_ss << "            uint32_t slice_cycles = ctx->frame_cycles - slice_start_cycles;\n";
+    main_ss << "            if (!gb_platform_poll_events(ctx)) {\n";
+    main_ss << "                running = false;\n";
+    main_ss << "                break;\n";
+    main_ss << "            }\n";
+    main_ss << "            if (smooth_lcd_transitions && !ctx->frame_done && slice_cycles >= lcd_smooth_slice_cycles) {\n";
+    main_ss << "                if (ctx->lcd_off_active || !(ctx->io[0x40] & 0x80)) {\n";
+    main_ss << "                    gb_platform_render_lcd_off_frame();\n";
+    main_ss << "                } else {\n";
+    main_ss << "                    const uint32_t* slice_fb = gb_get_framebuffer(ctx);\n";
+    main_ss << "                    if (slice_fb) gb_platform_present_framebuffer(slice_fb);\n";
+    main_ss << "                }\n";
+    main_ss << "                gb_platform_get_timing_info(&timing_info);\n";
+    main_ss << "                render_ms += timing_info.total_render_ms;\n";
+    main_ss << "                upload_ms += timing_info.upload_ms;\n";
+    main_ss << "                compose_ms += timing_info.compose_ms;\n";
+    main_ss << "                present_ms += timing_info.present_ms;\n";
+    main_ss << "                gb_platform_vsync(slice_cycles);\n";
+    main_ss << "                paced_cycles += slice_cycles;\n";
+    main_ss << "            }\n";
+    main_ss << "        }\n";
+    main_ss << "        if (!running) break;\n";
     main_ss << "        if (ctx->frame_done) {\n";
+    main_ss << "            uint32_t completed_frame_cycles = ctx->frame_cycles;\n";
+    main_ss << "            uint32_t final_pacing_cycles = (completed_frame_cycles > paced_cycles) ? (completed_frame_cycles - paced_cycles) : 0;\n";
+    main_ss << "            frame_index++;\n";
     main_ss << "            const uint32_t* fb = gb_get_framebuffer(ctx);\n";
     main_ss << "            if (fb) gb_platform_render_frame(fb);\n";
-    main_ss << "            gb_reset_frame(ctx);\n";
-    main_ss << "            ctx->stopped = 0;\n";
-    main_ss << "            gb_platform_vsync();\n";
+    main_ss << "            gb_platform_get_timing_info(&timing_info);\n";
+    main_ss << "            render_ms += timing_info.total_render_ms;\n";
+    main_ss << "            upload_ms += timing_info.upload_ms;\n";
+    main_ss << "            compose_ms += timing_info.compose_ms;\n";
+    main_ss << "            present_ms += timing_info.present_ms;\n";
+    main_ss << "            if ((slow_frame_ms > 0.0 && (emu_ms + render_ms) >= slow_frame_ms) ||\n";
+    main_ss << "                (log_frame_fallbacks && ctx->frame_dispatch_fallbacks > 0)) {\n";
+    main_ss << "                fprintf(stderr,\n";
+    main_ss << "                        \"[FRAME] #%llu emu=%.3fms render=%.3fms upload=%.3fms compose=%.3fms present=%.3fms cycles=%u fallbacks=%u first=%03X:%04X last=%03X:%04X total_fallbacks=%llu lcd_off_cycles=%u lcd_transitions=%u lcd_spans=%u last_lcd_off_span=%u\\n\",\n";
+    main_ss << "                        frame_index,\n";
+    main_ss << "                        emu_ms,\n";
+    main_ss << "                        render_ms,\n";
+    main_ss << "                        upload_ms,\n";
+    main_ss << "                        compose_ms,\n";
+    main_ss << "                        present_ms,\n";
+    main_ss << "                        completed_frame_cycles,\n";
+    main_ss << "                        ctx->frame_dispatch_fallbacks,\n";
+    main_ss << "                        (unsigned)ctx->frame_first_fallback_bank,\n";
+    main_ss << "                        ctx->frame_first_fallback_addr,\n";
+    main_ss << "                        (unsigned)ctx->frame_last_fallback_bank,\n";
+    main_ss << "                        ctx->frame_last_fallback_addr,\n";
+    main_ss << "                        (unsigned long long)ctx->total_dispatch_fallbacks,\n";
+    main_ss << "                        ctx->frame_lcd_off_cycles,\n";
+    main_ss << "                        ctx->frame_lcd_transition_count,\n";
+    main_ss << "                        ctx->frame_lcd_off_span_count,\n";
+    main_ss << "                        ctx->last_lcd_off_span_cycles);\n";
+    main_ss << "            }\n";
+    main_ss << "            if (final_pacing_cycles > 0) {\n";
+    main_ss << "                gb_platform_vsync(final_pacing_cycles);\n";
+    main_ss << "                gb_platform_get_timing_info(&timing_info);\n";
+    main_ss << "                vsync_ms = timing_info.pacing_ms;\n";
+    main_ss << "            }\n";
+    main_ss << "            if (slow_vsync_ms > 0.0 && vsync_ms >= slow_vsync_ms) {\n";
+    main_ss << "                fprintf(stderr,\n";
+    main_ss << "                        \"[VSYNC] #%llu wait=%.3fms cycles=%u\\n\",\n";
+    main_ss << "                        frame_index,\n";
+    main_ss << "                        vsync_ms,\n";
+    main_ss << "                        final_pacing_cycles);\n";
+    main_ss << "            }\n";
     main_ss << "        }\n";
     main_ss << "    }\n";
     main_ss << "    gb_platform_shutdown();\n";
@@ -2071,6 +2420,7 @@ GeneratedOutput generate_output(const ir::Program& program,
     cmake_ss << "# Create runtime library with PPU and platform support\n";
     cmake_ss << "add_library(gbrt STATIC\n";
     cmake_ss << "    ${GBRT_DIR}/src/gbrt.c\n";
+    cmake_ss << "    ${GBRT_DIR}/src/differential.c\n";
     cmake_ss << "    ${GBRT_DIR}/src/ppu.c\n";
     cmake_ss << "    ${GBRT_DIR}/src/audio.c\n";
     cmake_ss << "    ${GBRT_DIR}/src/audio_stats.c\n";
@@ -2096,11 +2446,30 @@ GeneratedOutput generate_output(const ir::Program& program,
     cmake_ss << "target_link_libraries(gbrt PUBLIC SDL2::SDL2)\n";
     cmake_ss << "target_compile_definitions(gbrt PUBLIC GB_HAS_SDL2)\n\n";
     cmake_ss << "# Main executable\n";
+    std::vector<std::string> generated_source_files = {options.output_prefix + ".c"};
+    for (const auto& extra_file : output.extra_files) {
+        if (extra_file.is_source) {
+            generated_source_files.push_back(extra_file.filename);
+        }
+    }
     cmake_ss << "add_executable(" << options.output_prefix << "\n";
     cmake_ss << "    " << options.output_prefix << "_main.c\n";
     cmake_ss << "    " << options.output_prefix << ".c\n";
+    for (const auto& extra_file : output.extra_files) {
+        if (extra_file.is_source) {
+            cmake_ss << "    " << extra_file.filename << "\n";
+        }
+    }
     cmake_ss << "    " << options.output_prefix << "_rom.c\n";
     cmake_ss << ")\n\n";
+    cmake_ss << "# The generated ROM translation unit is very large; keep it below -O3 so rebuilds stay practical.\n";
+    cmake_ss << "set(GBRECOMP_GENERATED_OPT_LEVEL \"1\" CACHE STRING \"Optimization level for the generated ROM source file\")\n";
+    cmake_ss << "set(GBRECOMP_GENERATED_SOURCES\n";
+    for (const auto& filename : generated_source_files) {
+        cmake_ss << "    " << filename << "\n";
+    }
+    cmake_ss << ")\n";
+    cmake_ss << "set_source_files_properties(${GBRECOMP_GENERATED_SOURCES} PROPERTIES COMPILE_OPTIONS \"-O${GBRECOMP_GENERATED_OPT_LEVEL}\")\n\n";
     cmake_ss << "target_link_libraries(" << options.output_prefix << " gbrt)\n";
     output.cmake_content = cmake_ss.str();
     output.cmake_file = "CMakeLists.txt";
@@ -2141,6 +2510,13 @@ bool write_output(const GeneratedOutput& output, const std::string& output_dir) 
         if (!main_file) return false;
         main_file << output.main_content;
         main_file.close();
+
+        for (const auto& extra_file : output.extra_files) {
+            std::ofstream out_file(out_path / extra_file.filename);
+            if (!out_file) return false;
+            out_file << extra_file.content;
+            out_file.close();
+        }
         
         // Write CMakeLists.txt
         std::ofstream cmake_file(out_path / output.cmake_file);

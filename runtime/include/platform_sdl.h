@@ -19,6 +19,15 @@ extern uint8_t g_joypad_dpad;
 
 typedef struct GBContext GBContext;
 
+typedef struct GBPlatformTimingInfo {
+    double upload_ms;
+    double compose_ms;
+    double present_ms;
+    double total_render_ms;
+    double pacing_ms;
+    uint32_t pacing_cycles;
+} GBPlatformTimingInfo;
+
 /**
  * @brief Initialize SDL2 platform (window, renderer)
  * @param scale Window scale factor (1-4)
@@ -48,6 +57,41 @@ bool gb_platform_poll_events(GBContext* ctx);
 void gb_platform_render_frame(const uint32_t* framebuffer);
 
 /**
+ * @brief Present a framebuffer without advancing guest-frame counters
+ */
+void gb_platform_present_framebuffer(const uint32_t* framebuffer);
+
+/**
+ * @brief Render a blank LCD-off presentation frame without advancing guest frame counters
+ */
+void gb_platform_render_lcd_off_frame(void);
+
+/**
+ * @brief Set input automation script (format: "frame:buttons:duration,...")
+ */
+void gb_platform_set_input_script(const char* script);
+
+/**
+ * @brief Record live keyboard/controller input to a replayable script file
+ */
+void gb_platform_set_input_record_file(const char* path);
+
+/**
+ * @brief Set frames to dump screenshots (format: "frame1,frame2,...")
+ */
+void gb_platform_set_dump_frames(const char* frames);
+
+/**
+ * @brief Set filename prefix for screenshots
+ */
+void gb_platform_set_screenshot_prefix(const char* prefix);
+
+/**
+ * @brief Get timing data captured during the most recent render/pacing pass
+ */
+void gb_platform_get_timing_info(GBPlatformTimingInfo* out);
+
+/**
  * @brief Get joypad state
  * @return Joypad byte (active low)
  */
@@ -56,7 +100,17 @@ uint8_t gb_platform_get_joypad(void);
 /**
  * @brief Wait for vsync / frame timing
  */
-void gb_platform_vsync(void);
+void gb_platform_vsync(uint32_t frame_cycles);
+
+/**
+ * @brief Query whether slow-frame presentation smoothing is enabled
+ */
+bool gb_platform_get_smooth_lcd_transitions(void);
+
+/**
+ * @brief Override whether slow-frame presentation smoothing is enabled
+ */
+void gb_platform_set_smooth_lcd_transitions(bool enabled);
 
 /**
  * @brief Set window title

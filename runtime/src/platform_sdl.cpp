@@ -32,14 +32,16 @@ static bool g_audio_started = false;
 static uint32_t g_audio_start_threshold = 0;
 
 /* Performance timing diagnostics */
-static uint32_t g_timing_render_total = 0;
-static uint32_t g_timing_vsync_total = 0;
+static double g_timing_render_total = 0.0;
+static double g_timing_vsync_total = 0.0;
 static uint32_t g_timing_frame_count = 0;
+static GBPlatformTimingInfo g_last_timing = {};
 
 /* Menu State */
 static bool g_show_menu = false;
 static int g_speed_percent = 100;
 static int g_palette_idx = 0;
+static bool g_smooth_lcd_transitions = true;
 static const char* g_palette_names[] = { "Original (Green)", "Black & White (Pocket)", "Amber (Plasma)" };
 static const char* g_scale_names[] = { "1x (160x144)", "2x (320x288)", "3x (480x432)", "4x (640x576)", "5x (800x720)", "6x (960x864)", "7x (1120x1008)", "8x (1280x1152)" };
 static const uint32_t g_palettes[][4] = {
@@ -47,10 +49,22 @@ static const uint32_t g_palettes[][4] = {
     { 0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000 }, // B&W
     { 0xFFFFB000, 0xFFCB4F0E, 0xFF800000, 0xFF330000 }  // Amber
 };
+static uint32_t g_lcd_off_framebuffer[GB_FRAMEBUFFER_SIZE];
+static bool g_lcd_off_framebuffer_initialized = false;
+
+static void update_audio_stats_from_ring(void);
+static uint32_t current_audio_underruns(void);
+static uint32_t current_audio_ring_fill_samples(void);
+static uint32_t current_audio_ring_capacity(void);
+static uint32_t audio_ring_fill_samples(void);
 
 /* Joypad state - exported for gbrt.c to access */
 uint8_t g_joypad_buttons = 0xFF;  /* Active low: Start, Select, B, A */
 uint8_t g_joypad_dpad = 0xFF;     /* Active low: Down, Up, Left, Right */
+static uint8_t g_manual_joypad_buttons = 0xFF;
+static uint8_t g_manual_joypad_dpad = 0xFF;
+static uint8_t g_script_joypad_buttons = 0xFF;
+static uint8_t g_script_joypad_dpad = 0xFF;
 
 /* ============================================================================
  * Automation State
@@ -69,6 +83,14 @@ typedef struct {
 
 static ScriptEntry g_input_script[MAX_SCRIPT_ENTRIES];
 static int g_script_count = 0;
+static FILE* g_input_record_file = NULL;
+static bool g_input_record_exit_handler_registered = false;
+static bool g_input_record_wrote_entry = false;
+static bool g_input_record_has_segment = false;
+static uint32_t g_input_record_start_frame = 0;
+static uint32_t g_input_record_duration = 0;
+static uint8_t g_input_record_dpad = 0xFF;
+static uint8_t g_input_record_buttons = 0xFF;
 
 #define MAX_DUMP_FRAMES 100
 static uint32_t g_dump_frames[MAX_DUMP_FRAMES];
@@ -90,13 +112,98 @@ static void parse_buttons(const char* btn_str, uint8_t* dpad, uint8_t* buttons) 
     if (strchr(btn_str, 'T')) *buttons &= ~0x04; /* Select (T for selecT) */
 }
 
+static void update_effective_joypad_state(void) {
+    g_joypad_dpad = g_manual_joypad_dpad & g_script_joypad_dpad;
+    g_joypad_buttons = g_manual_joypad_buttons & g_script_joypad_buttons;
+}
+
+static void request_joypad_interrupt(GBContext* ctx) {
+    if (!ctx) return;
+    ctx->io[0x0F] |= 0x10;
+    if (ctx->halted) ctx->halted = 0;
+}
+
+static bool input_state_has_press(uint8_t dpad, uint8_t buttons) {
+    return dpad != 0xFF || buttons != 0xFF;
+}
+
+static void write_buttons(FILE* file, uint8_t dpad, uint8_t buttons) {
+    if (!(dpad & 0x04)) fputc('U', file);
+    if (!(dpad & 0x08)) fputc('D', file);
+    if (!(dpad & 0x02)) fputc('L', file);
+    if (!(dpad & 0x01)) fputc('R', file);
+    if (!(buttons & 0x01)) fputc('A', file);
+    if (!(buttons & 0x02)) fputc('B', file);
+    if (!(buttons & 0x08)) fputc('S', file);
+    if (!(buttons & 0x04)) fputc('T', file);
+}
+
+static void flush_input_record_segment(void) {
+    if (!g_input_record_file || !g_input_record_has_segment) return;
+
+    if (g_input_record_duration > 0 && input_state_has_press(g_input_record_dpad, g_input_record_buttons)) {
+        if (g_input_record_wrote_entry) {
+            fputc(',', g_input_record_file);
+        }
+        fprintf(g_input_record_file, "%u:", g_input_record_start_frame);
+        write_buttons(g_input_record_file, g_input_record_dpad, g_input_record_buttons);
+        fprintf(g_input_record_file, ":%u", g_input_record_duration);
+        fflush(g_input_record_file);
+        g_input_record_wrote_entry = true;
+    }
+
+    g_input_record_has_segment = false;
+    g_input_record_start_frame = 0;
+    g_input_record_duration = 0;
+    g_input_record_dpad = 0xFF;
+    g_input_record_buttons = 0xFF;
+}
+
+static void close_input_record_file(void) {
+    if (!g_input_record_file) return;
+    flush_input_record_segment();
+    fputc('\n', g_input_record_file);
+    fclose(g_input_record_file);
+    g_input_record_file = NULL;
+    g_input_record_wrote_entry = false;
+}
+
+static void record_manual_input_frame(uint32_t frame_index) {
+    if (!g_input_record_file) return;
+
+    if (!g_input_record_has_segment) {
+        g_input_record_has_segment = true;
+        g_input_record_start_frame = frame_index;
+        g_input_record_duration = 1;
+        g_input_record_dpad = g_manual_joypad_dpad;
+        g_input_record_buttons = g_manual_joypad_buttons;
+        return;
+    }
+
+    if (g_input_record_dpad == g_manual_joypad_dpad && g_input_record_buttons == g_manual_joypad_buttons) {
+        g_input_record_duration++;
+        return;
+    }
+
+    flush_input_record_segment();
+    g_input_record_has_segment = true;
+    g_input_record_start_frame = frame_index;
+    g_input_record_duration = 1;
+    g_input_record_dpad = g_manual_joypad_dpad;
+    g_input_record_buttons = g_manual_joypad_buttons;
+}
+
 void gb_platform_set_input_script(const char* script) {
     // Format: frame:buttons:duration,...
+    g_script_count = 0;
+    g_script_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+    update_effective_joypad_state();
+
     if (!script) return;
     
     char* copy = strdup(script);
     char* token = strtok(copy, ",");
-    g_script_count = 0;
     
     while (token && g_script_count < MAX_SCRIPT_ENTRIES) {
         uint32_t frame = 0, duration = 0;
@@ -112,6 +219,30 @@ void gb_platform_set_input_script(const char* script) {
         token = strtok(NULL, ",");
     }
     free(copy);
+}
+
+void gb_platform_set_input_record_file(const char* path) {
+    if (!g_input_record_exit_handler_registered) {
+        atexit(close_input_record_file);
+        g_input_record_exit_handler_registered = true;
+    }
+
+    close_input_record_file();
+    g_input_record_has_segment = false;
+    g_input_record_start_frame = 0;
+    g_input_record_duration = 0;
+    g_input_record_dpad = 0xFF;
+    g_input_record_buttons = 0xFF;
+
+    if (!path || !path[0]) return;
+
+    g_input_record_file = fopen(path, "w");
+    if (!g_input_record_file) {
+        fprintf(stderr, "[AUTO] Failed to open input record file '%s'\n", path);
+        return;
+    }
+
+    fprintf(stderr, "[AUTO] Recording live input to %s\n", path);
 }
 
 void gb_platform_set_dump_frames(const char* frames) {
@@ -162,11 +293,187 @@ static void save_ppm(const char* filename, const uint32_t* fb, int width, int he
 
 static int g_frame_count = 0;
 
+static double sdl_now_ms(void) {
+    uint64_t ticks = SDL_GetPerformanceCounter();
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    return freq ? ((double)ticks * 1000.0) / (double)freq : 0.0;
+}
+
+static void ensure_lcd_off_framebuffer(void) {
+    if (g_lcd_off_framebuffer_initialized) {
+        return;
+    }
+
+    for (int i = 0; i < GB_FRAMEBUFFER_SIZE; i++) {
+        g_lcd_off_framebuffer[i] = 0xFFE0F8D0;
+    }
+
+    g_lcd_off_framebuffer_initialized = true;
+}
+
+static void render_frame_internal(const uint32_t* framebuffer, bool count_guest_frame) {
+    if (!g_texture || !g_renderer || !framebuffer) {
+        DBG_FRAME("Platform render_frame: SKIPPED (null: texture=%d, renderer=%d, fb=%d)",
+                  g_texture == NULL, g_renderer == NULL, framebuffer == NULL);
+        return;
+    }
+
+    double total_render_start_ms = sdl_now_ms();
+    if (count_guest_frame) {
+        g_frame_count++;
+    }
+
+    if (count_guest_frame) {
+        /* Handle Screenshot Dumping */
+        for (int i = 0; i < g_dump_count; i++) {
+            if (g_dump_frames[i] == (uint32_t)g_frame_count) {
+                char filename[128];
+                snprintf(filename, sizeof(filename), "%s_%05d.ppm", g_screenshot_prefix, g_frame_count);
+                save_ppm(filename, framebuffer, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT, g_frame_count);
+            }
+        }
+    }
+
+    /* Debug: check framebuffer content on first few guest frames */
+    if (count_guest_frame && g_frame_count <= 3) {
+        bool has_content = false;
+        uint32_t white = 0xFFE0F8D0;
+        for (int i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
+            if (framebuffer[i] != white) {
+                has_content = true;
+                break;
+            }
+        }
+        DBG_FRAME("Platform frame %d - has_content=%d, first_pixel=0x%08X",
+                  g_frame_count, has_content, framebuffer[0]);
+    }
+
+    if (count_guest_frame && (g_frame_count % 60) == 0) {
+        char title[64];
+        snprintf(title, sizeof(title), "GameBoy Recompiled - Frame %d", g_frame_count);
+        SDL_SetWindowTitle(g_window, title);
+    }
+
+    /* Update texture */
+    double upload_start_ms = sdl_now_ms();
+    void* pixels;
+    int pitch;
+    SDL_LockTexture(g_texture, NULL, &pixels, &pitch);
+
+    const uint32_t* src = framebuffer;
+    uint32_t* dst = (uint32_t*)pixels;
+
+    if (g_palette_idx == 0) {
+        memcpy(dst, src, GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT * sizeof(uint32_t));
+    } else {
+        uint32_t original_palette[4] = { 0xFFE0F8D0, 0xFF88C070, 0xFF346856, 0xFF081820 };
+
+        for (int i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
+            uint32_t c = src[i];
+            int color_idx = -1;
+            if (c == original_palette[0]) color_idx = 0;
+            else if (c == original_palette[1]) color_idx = 1;
+            else if (c == original_palette[2]) color_idx = 2;
+            else if (c == original_palette[3]) color_idx = 3;
+
+            if (color_idx >= 0) {
+                dst[i] = g_palettes[g_palette_idx][color_idx];
+            } else {
+                dst[i] = c;
+            }
+        }
+    }
+
+    SDL_UnlockTexture(g_texture);
+    g_last_timing.upload_ms = sdl_now_ms() - upload_start_ms;
+
+    /* Clear and render */
+    double compose_start_ms = sdl_now_ms();
+    SDL_RenderClear(g_renderer);
+    SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+
+    ImGui_ImplSDLRenderer2_NewFrame();
+    ImGui_ImplSDL2_NewFrame();
+    ImGui::NewFrame();
+
+    if (g_show_menu) {
+        ImGui::Begin("GameBoy Recompiled", &g_show_menu);
+        ImGui::Text("Performance: %.1f FPS", ImGui::GetIO().Framerate);
+        int scale_idx = g_scale - 1;
+        if (ImGui::Combo("Resolution", &scale_idx, g_scale_names, IM_ARRAYSIZE(g_scale_names))) {
+            g_scale = scale_idx + 1;
+            SDL_SetWindowSize(g_window, GB_SCREEN_WIDTH * g_scale, GB_SCREEN_HEIGHT * g_scale);
+            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+
+        if (ImGui::Checkbox("V-Sync", &g_vsync)) {
+            SDL_RenderSetVSync(g_renderer, g_vsync ? 1 : 0);
+        }
+
+        ImGui::Checkbox("Smooth Slow Frames", &g_smooth_lcd_transitions);
+        ImGui::SliderInt("Speed %", &g_speed_percent, 10, 500);
+        if (ImGui::Button("Reset Speed")) g_speed_percent = 100;
+        ImGui::Combo("Palette", &g_palette_idx, g_palette_names, IM_ARRAYSIZE(g_palette_names));
+
+        if (ImGui::Button("Reset to Defaults")) {
+            g_scale = 3;
+            g_speed_percent = 100;
+            g_palette_idx = 0;
+            g_smooth_lcd_transitions = true;
+            SDL_SetWindowSize(g_window, GB_SCREEN_WIDTH * g_scale, GB_SCREEN_HEIGHT * g_scale);
+            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+
+        if (ImGui::Button("Quit")) {
+            SDL_Event quit_event;
+            quit_event.type = SDL_QUIT;
+            SDL_PushEvent(&quit_event);
+        }
+        ImGui::End();
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.35f);
+        if (ImGui::Begin("Overlay", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
+            update_audio_stats_from_ring();
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::Text("Press ESC for Menu");
+            if (g_timing_frame_count > 0) {
+                float avg_render = (float)(g_timing_render_total / g_timing_frame_count);
+                float avg_vsync = (float)(g_timing_vsync_total / g_timing_frame_count);
+                ImGui::Text("Render: %.1fms, VSync: %.1fms", avg_render, avg_vsync);
+                ImGui::Text("Upload: %.2f Compose: %.2f Present: %.2f",
+                            (float)g_last_timing.upload_ms,
+                            (float)g_last_timing.compose_ms,
+                            (float)g_last_timing.present_ms);
+                ImGui::Text("AudioBuf: %u/%u, Underruns:%u",
+                            current_audio_ring_fill_samples(),
+                            current_audio_ring_capacity(),
+                            current_audio_underruns());
+                ImGui::Text("Smooth Slow Frames: %s", g_smooth_lcd_transitions ? "On" : "Off");
+                ImGui::TextUnformatted(audio_stats_get_summary());
+            }
+            ImGui::End();
+        }
+    }
+
+    ImGui::Render();
+    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
+    g_last_timing.compose_ms = sdl_now_ms() - compose_start_ms;
+
+    double present_start_ms = sdl_now_ms();
+    SDL_RenderPresent(g_renderer);
+    g_last_timing.present_ms = sdl_now_ms() - present_start_ms;
+    g_last_timing.total_render_ms = sdl_now_ms() - total_render_start_ms;
+    g_timing_render_total += g_last_timing.total_render_ms;
+}
+
 /* ============================================================================
  * Platform Functions
  * ========================================================================== */
 
 void gb_platform_shutdown(void) {
+    close_input_record_file();
+
     if (g_audio_device) {
         SDL_CloseAudioDevice(g_audio_device);
         g_audio_device = 0;
@@ -219,6 +526,18 @@ static uint32_t g_audio_device_sample_rate = AUDIO_SAMPLE_RATE;
 /* Debug counters */
 static uint32_t g_audio_samples_written = 0;
 static uint32_t g_audio_underruns = 0;
+
+static uint32_t current_audio_underruns(void) {
+    return g_audio_underruns;
+}
+
+static uint32_t current_audio_ring_fill_samples(void) {
+    return audio_ring_fill_samples();
+}
+
+static uint32_t current_audio_ring_capacity(void) {
+    return AUDIO_RING_SIZE;
+}
 
 static uint32_t audio_ring_fill_samples(void) {
     uint32_t write_pos = g_audio_write_pos.load(std::memory_order_acquire);
@@ -286,6 +605,12 @@ bool gb_platform_init(int scale) {
     g_scale = scale;
     if (g_scale < 1) g_scale = 1;
     if (g_scale > 8) g_scale = 8;
+    g_frame_count = 0;
+    g_manual_joypad_buttons = 0xFF;
+    g_manual_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+    g_script_joypad_dpad = 0xFF;
+    update_effective_joypad_state();
     
     fprintf(stderr, "[SDL] Initializing SDL...\n");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) < 0) {
@@ -422,27 +747,27 @@ bool gb_platform_poll_events(GBContext* ctx) {
 
                 if (event.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX) {
                     if (event.caxis.value > deadzone) {
-                        g_joypad_dpad &= ~0x01;
-                        g_joypad_dpad |= 0x02;
+                        g_manual_joypad_dpad &= ~0x01;
+                        g_manual_joypad_dpad |= 0x02;
                     } else if (event.caxis.value < -deadzone) {
-                        g_joypad_dpad &= ~0x02;
-                        g_joypad_dpad |= 0x01;
+                        g_manual_joypad_dpad &= ~0x02;
+                        g_manual_joypad_dpad |= 0x01;
                     } else {
-                        g_joypad_dpad |= 0x01;
-                        g_joypad_dpad |= 0x02;
+                        g_manual_joypad_dpad |= 0x01;
+                        g_manual_joypad_dpad |= 0x02;
                     }
                 }
 
                 if (event.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) {
                     if (event.caxis.value > deadzone) {
-                        g_joypad_dpad &= ~0x08;
-                        g_joypad_dpad |= 0x04;
+                        g_manual_joypad_dpad &= ~0x08;
+                        g_manual_joypad_dpad |= 0x04;
                     } else if (event.caxis.value < -deadzone) {
-                        g_joypad_dpad &= ~0x04;
-                        g_joypad_dpad |= 0x08;
+                        g_manual_joypad_dpad &= ~0x04;
+                        g_manual_joypad_dpad |= 0x08;
                     } else {
-                        g_joypad_dpad |= 0x04;
-                        g_joypad_dpad |= 0x08;
+                        g_manual_joypad_dpad |= 0x04;
+                        g_manual_joypad_dpad |= 0x08;
                     }
                 }
 
@@ -455,45 +780,46 @@ bool gb_platform_poll_events(GBContext* ctx) {
 
                 switch (event.cbutton.button) {
                     case SDL_CONTROLLER_BUTTON_DPAD_UP:
-                        if (pressed) g_joypad_dpad &= ~0x04;
-                        else g_joypad_dpad |= 0x04;
+                        if (pressed) g_manual_joypad_dpad &= ~0x04;
+                        else g_manual_joypad_dpad |= 0x04;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
-                        if (pressed) g_joypad_dpad &= ~0x08;
-                        else g_joypad_dpad |= 0x08;
+                        if (pressed) g_manual_joypad_dpad &= ~0x08;
+                        else g_manual_joypad_dpad |= 0x08;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-                        if (pressed) g_joypad_dpad &= ~0x02;
-                        else g_joypad_dpad |= 0x02;
+                        if (pressed) g_manual_joypad_dpad &= ~0x02;
+                        else g_manual_joypad_dpad |= 0x02;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-                        if (pressed) g_joypad_dpad &= ~0x01;
-                        else g_joypad_dpad |= 0x01;
+                        if (pressed) g_manual_joypad_dpad &= ~0x01;
+                        else g_manual_joypad_dpad |= 0x01;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_A:
-                        if (pressed) g_joypad_buttons &= ~0x01;
-                        else g_joypad_buttons |= 0x01;
+                        if (pressed) g_manual_joypad_buttons &= ~0x01;
+                        else g_manual_joypad_buttons |= 0x01;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_B:
-                        if (pressed) g_joypad_buttons &= ~0x02;
-                        else g_joypad_buttons |= 0x02;
+                        if (pressed) g_manual_joypad_buttons &= ~0x02;
+                        else g_manual_joypad_buttons |= 0x02;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_START:
-                        if (pressed) g_joypad_buttons &= ~0x08;
-                        else g_joypad_buttons |= 0x08;
+                        if (pressed) g_manual_joypad_buttons &= ~0x08;
+                        else g_manual_joypad_buttons |= 0x08;
                         break;
 
                     case SDL_CONTROLLER_BUTTON_BACK:
-                        if (pressed) g_joypad_buttons &= ~0x04;
-                        else g_joypad_buttons |= 0x04;
+                        if (pressed) g_manual_joypad_buttons &= ~0x04;
+                        else g_manual_joypad_buttons |= 0x04;
                         break;
                 }
+                break;
             }
 
             case SDL_KEYDOWN:
@@ -505,44 +831,44 @@ bool gb_platform_poll_events(GBContext* ctx) {
                     /* D-pad */
                     case SDL_SCANCODE_UP:
                     case SDL_SCANCODE_W:
-                        if (pressed) { g_joypad_dpad &= ~0x04; if (dpad_selected) trigger = true; }
-                        else g_joypad_dpad |= 0x04;
+                        if (pressed) { g_manual_joypad_dpad &= ~0x04; if (dpad_selected) trigger = true; }
+                        else g_manual_joypad_dpad |= 0x04;
                         break;
                     case SDL_SCANCODE_DOWN:
                     case SDL_SCANCODE_S:
-                        if (pressed) { g_joypad_dpad &= ~0x08; if (dpad_selected) trigger = true; }
-                        else g_joypad_dpad |= 0x08;
+                        if (pressed) { g_manual_joypad_dpad &= ~0x08; if (dpad_selected) trigger = true; }
+                        else g_manual_joypad_dpad |= 0x08;
                         break;
                     case SDL_SCANCODE_LEFT:
                     case SDL_SCANCODE_A:
-                        if (pressed) { g_joypad_dpad &= ~0x02; if (dpad_selected) trigger = true; }
-                        else g_joypad_dpad |= 0x02;
+                        if (pressed) { g_manual_joypad_dpad &= ~0x02; if (dpad_selected) trigger = true; }
+                        else g_manual_joypad_dpad |= 0x02;
                         break;
                     case SDL_SCANCODE_RIGHT:
                     case SDL_SCANCODE_D:
-                        if (pressed) { g_joypad_dpad &= ~0x01; if (dpad_selected) trigger = true; }
-                        else g_joypad_dpad |= 0x01;
+                        if (pressed) { g_manual_joypad_dpad &= ~0x01; if (dpad_selected) trigger = true; }
+                        else g_manual_joypad_dpad |= 0x01;
                         break;
                     
                     /* Buttons */
                     case SDL_SCANCODE_Z:
                     case SDL_SCANCODE_J:
-                        if (pressed) { g_joypad_buttons &= ~0x01; if (buttons_selected) trigger = true; } /* A */
-                        else g_joypad_buttons |= 0x01;
+                        if (pressed) { g_manual_joypad_buttons &= ~0x01; if (buttons_selected) trigger = true; } /* A */
+                        else g_manual_joypad_buttons |= 0x01;
                         break;
                     case SDL_SCANCODE_X:
                     case SDL_SCANCODE_K:
-                        if (pressed) { g_joypad_buttons &= ~0x02; if (buttons_selected) trigger = true; } /* B */
-                        else g_joypad_buttons |= 0x02;
+                        if (pressed) { g_manual_joypad_buttons &= ~0x02; if (buttons_selected) trigger = true; } /* B */
+                        else g_manual_joypad_buttons |= 0x02;
                         break;
                     case SDL_SCANCODE_RSHIFT:
                     case SDL_SCANCODE_BACKSPACE:
-                        if (pressed) { g_joypad_buttons &= ~0x04; if (buttons_selected) trigger = true; } /* Select */
-                        else g_joypad_buttons |= 0x04;
+                        if (pressed) { g_manual_joypad_buttons &= ~0x04; if (buttons_selected) trigger = true; } /* Select */
+                        else g_manual_joypad_buttons |= 0x04;
                         break;
                     case SDL_SCANCODE_RETURN:
-                        if (pressed) { g_joypad_buttons &= ~0x08; if (buttons_selected) trigger = true; } /* Start */
-                        else g_joypad_buttons |= 0x08;
+                        if (pressed) { g_manual_joypad_buttons &= ~0x08; if (buttons_selected) trigger = true; } /* Start */
+                        else g_manual_joypad_buttons |= 0x08;
                         break;
                     
                     case SDL_SCANCODE_ESCAPE:
@@ -556,9 +882,7 @@ bool gb_platform_poll_events(GBContext* ctx) {
                 }
                 
                 if (trigger && ctx && event.key.repeat == 0) {
-                    ctx->io[0x0F] |= 0x10; /* Request Joypad Interrupt */
-                    /* Also wake up HALT state immediately if needed, though handle_interrupts does it */
-                    if (ctx->halted) ctx->halted = 0;
+                    request_joypad_interrupt(ctx);
                 }
                 break;
             }
@@ -572,27 +896,27 @@ bool gb_platform_poll_events(GBContext* ctx) {
     }
     
     /* Handle Automation Inputs */
+    uint8_t previous_script_dpad = g_script_joypad_dpad;
+    uint8_t previous_script_buttons = g_script_joypad_buttons;
+    g_script_joypad_dpad = 0xFF;
+    g_script_joypad_buttons = 0xFF;
+
     for (int i = 0; i < g_script_count; i++) {
         ScriptEntry* e = &g_input_script[i];
         if (g_frame_count >= e->start_frame && g_frame_count < (e->start_frame + e->duration)) {
-             // Apply inputs (ANDing masks)
-             g_joypad_dpad &= e->dpad;
-             g_joypad_buttons &= e->buttons;
-             
-             // Check triggers
-             bool trigger = false;
-             if ((~e->dpad & 0x0F) && dpad_selected) trigger = true;
-             if ((~e->buttons & 0x0F) && buttons_selected) trigger = true;
-             
-                if (trigger && ctx) {
-                    /* Only trigger on initial press, not repeats or continuous hold */
-                     if (g_frame_count == e->start_frame) {
-                        ctx->io[0x0F] |= 0x10;
-                        if (ctx->halted) ctx->halted = 0;
-                     }
-                }
+             g_script_joypad_dpad &= e->dpad;
+             g_script_joypad_buttons &= e->buttons;
         }
     }
+
+    uint8_t new_script_dpad = (uint8_t)(previous_script_dpad & (uint8_t)(~g_script_joypad_dpad) & 0x0F);
+    uint8_t new_script_buttons = (uint8_t)(previous_script_buttons & (uint8_t)(~g_script_joypad_buttons) & 0x0F);
+    if (ctx && ((new_script_dpad && dpad_selected) || (new_script_buttons && buttons_selected))) {
+        request_joypad_interrupt(ctx);
+    }
+
+    update_effective_joypad_state();
+    record_manual_input_frame((uint32_t)g_frame_count);
 
     return true;
 }
@@ -600,141 +924,21 @@ bool gb_platform_poll_events(GBContext* ctx) {
 
 
 void gb_platform_render_frame(const uint32_t* framebuffer) {
-    if (!g_texture || !g_renderer || !framebuffer) {
-        DBG_FRAME("Platform render_frame: SKIPPED (null: texture=%d, renderer=%d, fb=%d)",
-                  g_texture == NULL, g_renderer == NULL, framebuffer == NULL);
-        return;
-    }
-    
-    g_frame_count++;
-    
-    /* Handle Screenshot Dumping */
-    for (int i = 0; i < g_dump_count; i++) {
-        if (g_dump_frames[i] == (uint32_t)g_frame_count) {
-             char filename[128];
-             snprintf(filename, sizeof(filename), "%s_%05d.ppm", g_screenshot_prefix, g_frame_count);
-             save_ppm(filename, framebuffer, GB_SCREEN_WIDTH, GB_SCREEN_HEIGHT, g_frame_count);
-        }
-    }
-    
-    /* Debug: check framebuffer content on first few frames */
-    if (g_frame_count <= 3) {
-        /* Check if framebuffer has any non-white pixels */
-        bool has_content = false;
-        uint32_t white = 0xFFE0F8D0;  /* DMG palette color 0 */
-        for (int i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
-            if (framebuffer[i] != white) {
-                has_content = true;
-                break;
-            }
-        }
-        DBG_FRAME("Platform frame %d - has_content=%d, first_pixel=0x%08X",
-                  g_frame_count, has_content, framebuffer[0]);
-    }
-    
-    if (g_frame_count % 60 == 0) {
-        char title[64];
-        snprintf(title, sizeof(title), "GameBoy Recompiled - Frame %d", g_frame_count);
-        SDL_SetWindowTitle(g_window, title);
-    }
-    
-    /* Update texture */
-    void* pixels;
-    int pitch;
-    SDL_LockTexture(g_texture, NULL, &pixels, &pitch);
-    
-    const uint32_t* src = framebuffer;
-    uint32_t* dst = (uint32_t*)pixels;
-    
-    if (g_palette_idx == 0) {
-        memcpy(dst, src, GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT * sizeof(uint32_t));
-    } else {
-        uint32_t original_palette[4] = { 0xFFE0F8D0, 0xFF88C070, 0xFF346856, 0xFF081820 };
-        
-        for (int i = 0; i < GB_SCREEN_WIDTH * GB_SCREEN_HEIGHT; i++) {
-            uint32_t c = src[i];
-            int color_idx = -1;
-            if (c == original_palette[0]) color_idx = 0;
-            else if (c == original_palette[1]) color_idx = 1;
-            else if (c == original_palette[2]) color_idx = 2;
-            else if (c == original_palette[3]) color_idx = 3;
-            
-            if (color_idx >= 0) {
-                dst[i] = g_palettes[g_palette_idx][color_idx];
-            } else {
-                dst[i] = c; 
-            }
-        }
-    }
-    
-    SDL_UnlockTexture(g_texture);
-    
-    /* Clear and render */
-    SDL_RenderClear(g_renderer);
-    SDL_RenderCopy(g_renderer, g_texture, NULL, NULL);
+    render_frame_internal(framebuffer, true);
+}
 
-    // ImGui Frame
-    ImGui_ImplSDLRenderer2_NewFrame();
-    ImGui_ImplSDL2_NewFrame();
-    ImGui::NewFrame();
+void gb_platform_present_framebuffer(const uint32_t* framebuffer) {
+    render_frame_internal(framebuffer, false);
+}
 
-    if (g_show_menu) {
-        ImGui::Begin("GameBoy Recompiled", &g_show_menu);
-        ImGui::Text("Performance: %.1f FPS", ImGui::GetIO().Framerate);
-        int scale_idx = g_scale - 1;
-        if (ImGui::Combo("Resolution", &scale_idx, g_scale_names, IM_ARRAYSIZE(g_scale_names))) {
-            g_scale = scale_idx + 1;
-            SDL_SetWindowSize(g_window, GB_SCREEN_WIDTH * g_scale, GB_SCREEN_HEIGHT * g_scale);
-            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-        }
+void gb_platform_render_lcd_off_frame(void) {
+    ensure_lcd_off_framebuffer();
+    render_frame_internal(g_lcd_off_framebuffer, false);
+}
 
-        if (ImGui::Checkbox("V-Sync", &g_vsync)) {
-            SDL_RenderSetVSync(g_renderer, g_vsync ? 1 : 0);
-        }
-
-        ImGui::SliderInt("Speed %", &g_speed_percent, 10, 500);
-        if (ImGui::Button("Reset Speed")) g_speed_percent = 100;
-        ImGui::Combo("Palette", &g_palette_idx, g_palette_names, IM_ARRAYSIZE(g_palette_names));
-
-        if (ImGui::Button("Reset to Defaults")) {
-            g_scale = 3;
-            g_speed_percent = 100;
-            SDL_SetWindowSize(g_window, GB_SCREEN_WIDTH * g_scale, GB_SCREEN_HEIGHT * g_scale);
-            SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-            g_palette_idx = 0;
-        }
-
-        if (ImGui::Button("Quit")) {
-            SDL_Event quit_event;
-            quit_event.type = SDL_QUIT;
-            SDL_PushEvent(&quit_event);
-        }
-        ImGui::End();
-    } else {
-        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.35f); 
-        if (ImGui::Begin("Overlay", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav)) {
-            update_audio_stats_from_ring();
-            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-            ImGui::Text("Press ESC for Menu");
-            /* Timing diagnostics */
-            if (g_timing_frame_count > 0) {
-                float avg_render = (float)g_timing_render_total / g_timing_frame_count;
-                float avg_vsync = (float)g_timing_vsync_total / g_timing_frame_count;
-                ImGui::Text("Render: %.1fms, VSync: %.1fms", avg_render, avg_vsync);
-                ImGui::Text("AudioBuf: %u/%u, Underruns:%u", audio_ring_fill_samples(), AUDIO_RING_SIZE, g_audio_underruns);
-                ImGui::TextUnformatted(audio_stats_get_summary());
-            }
-            ImGui::End();
-        }
-    }
-
-    ImGui::Render();
-    ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData());
-
-    uint32_t render_start = SDL_GetTicks();
-    SDL_RenderPresent(g_renderer);
-    g_timing_render_total += SDL_GetTicks() - render_start;
+void gb_platform_get_timing_info(GBPlatformTimingInfo* out) {
+    if (!out) return;
+    *out = g_last_timing;
 }
 
 uint8_t gb_platform_get_joypad(void) {
@@ -743,54 +947,93 @@ uint8_t gb_platform_get_joypad(void) {
     return g_joypad_buttons & g_joypad_dpad;
 }
 
-void gb_platform_vsync(void) {
+void gb_platform_vsync(uint32_t frame_cycles) {
     /* 
      * Frame pacing: Run at the DMG frame cadence derived from 70224 cycles
      * at 4194304 Hz, and ease off sleeping when audio fill is too low.
+     *
+     * Each call accounts for the frame that just completed. Keep an
+     * accumulated wall-clock target and advance it before waiting so the
+     * current frame's cycle count is what determines the current sleep.
      */
     static uint64_t next_frame_time = 0;
     static uint64_t frame_remainder = 0;
-    const uint64_t gb_frame_cycles = 70224;
+    const uint64_t gb_frame_cycles = (frame_cycles > 0) ? (uint64_t)frame_cycles : 70224ull;
     const uint64_t gb_cpu_hz = 4194304;
     uint64_t freq = SDL_GetPerformanceFrequency();
     uint64_t now = SDL_GetPerformanceCounter();
-    
+    uint32_t speed_percent = (g_speed_percent > 0) ? (uint32_t)g_speed_percent : 100;
+    uint64_t frame_ticks_num = (freq * gb_frame_cycles * 100ull) + frame_remainder;
+    uint64_t frame_ticks_den = gb_cpu_hz * (uint64_t)speed_percent;
+    uint64_t frame_ticks = frame_ticks_num / frame_ticks_den;
+    double pacing_start_ms = sdl_now_ms();
+
+    if (frame_ticks == 0) {
+        frame_ticks = 1;
+    }
+
     if (next_frame_time == 0) {
         next_frame_time = now;
     }
 
+    frame_remainder = frame_ticks_num % frame_ticks_den;
+    next_frame_time += frame_ticks;
+    uint64_t target_frame_time = next_frame_time;
+
     uint32_t audio_fill = audio_ring_fill_samples();
     bool audio_starved = g_audio_started && audio_fill < (g_audio_start_threshold / 2);
 
-    if (!audio_starved && now < next_frame_time) {
-        uint64_t wait_ticks = next_frame_time - now;
-        uint32_t wait_us = (uint32_t)((wait_ticks * 1000000) / freq);
-        
-        /* Use SDL_Delay for longer waits, busy-wait for precision */
-        if (wait_us > 2000) {
-            SDL_Delay((wait_us - 1000) / 1000);
+    if (!audio_starved && now < target_frame_time) {
+        for (;;) {
+            uint64_t wait_ticks = target_frame_time - now;
+            uint32_t wait_us = (uint32_t)((wait_ticks * 1000000) / freq);
+
+            /*
+             * SDL_Delay() can oversleep by several milliseconds on desktop OSes.
+             * Sleep in small chunks, then busy-wait the tail for stable pacing.
+             */
+            if (wait_us > 4000) {
+                SDL_Delay((wait_us / 1000) - 2);
+            } else if (wait_us > 1500) {
+                SDL_Delay(1);
+            } else {
+                break;
+            }
+
+            now = SDL_GetPerformanceCounter();
+            if (now >= target_frame_time) {
+                break;
+            }
         }
-        /* Busy-wait the remainder for precision */
-        while (SDL_GetPerformanceCounter() < next_frame_time) {
+
+        while (SDL_GetPerformanceCounter() < target_frame_time) {
             /* spin */
         }
+        now = SDL_GetPerformanceCounter();
     }
-    
-    /* Schedule next frame */
-    uint64_t frame_ticks_num = (freq * gb_frame_cycles) + frame_remainder;
-    next_frame_time += frame_ticks_num / gb_cpu_hz;
-    frame_remainder = frame_ticks_num % gb_cpu_hz;
-    
+
     /* If we fell behind by more than 3 frames, reset (don't try to catch up) */
-    uint64_t max_frame_lag = ((freq * gb_frame_cycles * 3) + gb_cpu_hz - 1) / gb_cpu_hz;
-    if (SDL_GetPerformanceCounter() > next_frame_time + max_frame_lag) {
-        next_frame_time = SDL_GetPerformanceCounter();
+    uint64_t max_frame_lag = frame_ticks * 3;
+    if (now > target_frame_time + max_frame_lag) {
+        next_frame_time = now;
         frame_remainder = 0;
     }
     
     update_audio_stats_from_ring();
     audio_stats_tick(SDL_GetTicks64());
+    g_last_timing.pacing_cycles = (uint32_t)gb_frame_cycles;
+    g_last_timing.pacing_ms = sdl_now_ms() - pacing_start_ms;
+    g_timing_vsync_total += g_last_timing.pacing_ms;
+    g_timing_frame_count++;
     g_last_frame_time = SDL_GetTicks();
+}
+
+bool gb_platform_get_smooth_lcd_transitions(void) {
+    return g_smooth_lcd_transitions;
+}
+
+void gb_platform_set_smooth_lcd_transitions(bool enabled) {
+    g_smooth_lcd_transitions = enabled;
 }
 
 void gb_platform_set_title(const char* title) {
@@ -879,19 +1122,42 @@ bool gb_platform_poll_events(GBContext* ctx) {
     return true;
 }
 
+void gb_platform_set_input_script(const char* script) { (void)script; }
+
+void gb_platform_set_input_record_file(const char* path) { (void)path; }
+
 void gb_platform_render_frame(const uint32_t* framebuffer) {
     (void)framebuffer;
+}
+
+void gb_platform_present_framebuffer(const uint32_t* framebuffer) {
+    (void)framebuffer;
+}
+
+void gb_platform_render_lcd_off_frame(void) {}
+
+void gb_platform_get_timing_info(GBPlatformTimingInfo* out) {
+    if (!out) return;
+    *out = GBPlatformTimingInfo{};
 }
 
 uint8_t gb_platform_get_joypad(void) {
     return 0xFF;
 }
 
-void gb_platform_vsync(void) {}
+void gb_platform_vsync(uint32_t frame_cycles) { (void)frame_cycles; }
+
+bool gb_platform_get_smooth_lcd_transitions(void) { return false; }
+
+void gb_platform_set_smooth_lcd_transitions(bool enabled) { (void)enabled; }
 
 void gb_platform_set_title(const char* title) {
     (void)title;
 }
+
+void gb_platform_set_dump_frames(const char* frames) { (void)frames; }
+
+void gb_platform_set_screenshot_prefix(const char* prefix) { (void)prefix; }
 
 void gb_platform_register_context(GBContext* ctx) { (void)ctx; }
 

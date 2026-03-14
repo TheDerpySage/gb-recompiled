@@ -46,8 +46,39 @@ typedef struct {
  * ========================================================================== */
 
 extern bool gbrt_trace_enabled;
+extern bool gbrt_log_lcd_transitions;
 extern uint64_t gbrt_instruction_count;
 extern uint64_t gbrt_instruction_limit;
+
+typedef struct {
+    uint8_t dpad;     /**< Active-low Right, Left, Up, Down bits */
+    uint8_t buttons;  /**< Active-low A, B, Select, Start bits */
+} GBJoypadState;
+
+typedef enum {
+    GB_EXECUTION_GENERATED = 0,
+    GB_EXECUTION_INTERPRETER = 1,
+} GBExecutionMode;
+
+typedef struct {
+    uint64_t max_steps;      /**< Number of scheduler steps to compare */
+    uint64_t max_frames;     /**< Number of completed frames to compare (0 disables frame limit) */
+    uint64_t log_interval;   /**< Progress log cadence (0 disables progress logs) */
+    bool compare_memory;     /**< Compare mutable memory/PPU state on every step */
+    bool log_fallbacks;      /**< Log generated-to-interpreter fallback events */
+    bool fail_on_fallback;   /**< Treat generated-to-interpreter fallback as a mismatch */
+    const char* input_script;/**< Optional scripted input in frame:buttons:duration format */
+} GBDifferentialOptions;
+
+typedef struct {
+    bool matched;            /**< True if both paths stayed in sync */
+    uint64_t steps_completed;/**< Number of completed comparison steps */
+    uint64_t frames_completed;/**< Number of completed frame boundaries */
+    uint64_t mismatch_step;  /**< Step index of the first mismatch */
+    uint16_t pc;             /**< PC at the start of the mismatching step */
+    uint16_t bank;           /**< Active ROM bank at the start of the mismatching step */
+    char message[256];       /**< Short mismatch description */
+} GBDifferentialResult;
 
 
 /* ============================================================================
@@ -114,6 +145,7 @@ typedef struct GBContext {
     uint8_t halted;       /**< CPU is halted */
     uint8_t stopped;      /**< CPU is stopped */
     uint8_t halt_bug;     /**< HALT bug: next instruction byte read twice */
+    uint8_t single_step_mode; /**< Debug mode: execute at most one instruction */
     
     /* OAM DMA state */
     struct {
@@ -141,7 +173,19 @@ typedef struct GBContext {
     uint32_t cycles;      /**< Cycles executed */
     uint32_t frame_cycles;/**< Cycles this frame */
     uint32_t last_sync_cycles; /**< Last cycles count synchronized with hardware */
+    uint32_t run_cycle_budget; /**< Active gb_run_cycles() slice budget, or 0 when unbounded */
+    uint32_t run_cycle_budget_start; /**< Cycle counter at the start of the active slice budget */
     uint8_t  frame_done;  /**< Frame is finished and rendered */
+    uint8_t  lcd_off_active; /**< LCDC bit 7 is currently off */
+    uint32_t lcd_off_start_cycles; /**< Global cycle when the current LCD-off span started */
+    uint32_t lcd_off_start_frame_cycles; /**< Frame-local cycle when the current LCD-off span started */
+    uint32_t frame_lcd_off_cycles; /**< Cycles spent with LCD disabled in the current rendered frame */
+    uint32_t frame_lcd_transition_count; /**< LCD on/off state changes seen in the current rendered frame */
+    uint32_t frame_lcd_off_span_count; /**< LCD-off spans completed in the current rendered frame */
+    uint32_t last_lcd_off_span_cycles; /**< Most recent LCD-off span length */
+    uint64_t total_lcd_off_cycles; /**< Total cycles spent with LCD disabled */
+    uint64_t total_lcd_transition_count; /**< Total LCD on/off state changes */
+    uint64_t total_lcd_off_span_count; /**< Total completed LCD-off spans */
     
     /* Timer internal state */
     uint16_t div_counter;   /**< Internal 16-bit divider counter */
@@ -173,6 +217,15 @@ typedef struct GBContext {
     void* serial;         /**< Serial port */
     void* joypad;         /**< Joypad input */
     uint8_t last_joypad;  /**< Last joypad state for interrupt generation */
+    uint8_t used_dispatch_fallback; /**< Generated path fell back to interpreter */
+    uint8_t dispatch_fallback_bank; /**< Bank used for the most recent fallback */
+    uint16_t dispatch_fallback_addr; /**< PC used for the most recent fallback */
+    uint32_t frame_dispatch_fallbacks; /**< Fallback count accumulated in the current frame */
+    uint64_t total_dispatch_fallbacks; /**< Total generated-to-interpreter fallbacks */
+    uint8_t frame_first_fallback_bank; /**< First fallback bank in the current frame */
+    uint16_t frame_first_fallback_addr; /**< First fallback PC in the current frame */
+    uint8_t frame_last_fallback_bank; /**< Last fallback bank in the current frame */
+    uint16_t frame_last_fallback_addr; /**< Last fallback PC in the current frame */
     
     /* Platform interface */
     void* platform;       /**< Platform-specific data */
@@ -361,6 +414,12 @@ void gb_dispatch_call(GBContext* ctx, uint16_t addr);
  */
 void gb_interpret(GBContext* ctx, uint16_t addr);
 
+/**
+ * @brief Execute known copied HRAM helper stubs in-place when possible
+ * @return 1 if a known HRAM stub instruction was executed, 0 otherwise
+ */
+uint8_t gbrt_try_execute_hram_stub(GBContext* ctx, uint16_t addr);
+
 /* ============================================================================
  * CPU State
  * ========================================================================== */
@@ -455,10 +514,38 @@ void gb_set_platform_callbacks(GBContext* ctx, const GBPlatformCallbacks* callba
 uint32_t gb_run_frame(GBContext* ctx);
 
 /**
+ * @brief Run emulation until a frame completes or the cycle budget is spent
+ * @param max_cycles Maximum cycles to execute before returning (0 = no limit)
+ * @return Number of cycles executed
+ */
+uint32_t gb_run_cycles(GBContext* ctx, uint32_t max_cycles);
+
+/**
  * @brief Run a single step (one instruction or until interrupt)
  * @return Number of cycles executed
  */
 uint32_t gb_step(GBContext* ctx);
+
+/**
+ * @brief Run one scheduler step in a specific execution mode
+ * @param mode Generated dispatch or interpreter execution
+ * @return Number of cycles executed
+ */
+uint32_t gb_debug_step(GBContext* ctx, GBExecutionMode mode);
+
+/**
+ * @brief Compare generated and interpreter execution in lockstep
+ * @return true if both paths stayed in sync for the full run
+ */
+bool gb_run_differential(GBContext* generated_ctx,
+                         GBContext* interpreted_ctx,
+                         const GBDifferentialOptions* options,
+                         GBDifferentialResult* result);
+
+/**
+ * @brief Record a generated-dispatch fallback into the interpreter
+ */
+void gbrt_note_dispatch_fallback(GBContext* ctx, uint8_t bank, uint16_t addr);
 
 /**
  * @brief Helper to invoke audio callback
@@ -469,6 +556,11 @@ void gb_audio_callback(GBContext* ctx, int16_t left, int16_t right);
  * @brief Set input automation script (format: "frame:buttons:duration,...")
  */
 void gb_platform_set_input_script(const char* script);
+
+/**
+ * @brief Record live keyboard/controller input to a replayable script file
+ */
+void gb_platform_set_input_record_file(const char* path);
 
 /**
  * @brief Set frames to dump screenshots (format: "frame1,frame2,...")
@@ -489,6 +581,7 @@ void gbrt_set_trace_file(const char* filename);
  * @brief Log an entry point to the trace file
  */
 void gbrt_log_trace(GBContext* ctx, uint16_t bank, uint16_t addr);
+void gbrt_note_lcd_transition(GBContext* ctx, bool lcd_enabled, uint8_t old_lcdc, uint8_t new_lcdc, uint8_t ly, uint8_t mode);
 
 #ifdef __cplusplus
 }

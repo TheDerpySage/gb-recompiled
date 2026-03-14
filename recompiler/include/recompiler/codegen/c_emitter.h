@@ -9,6 +9,7 @@
 #include "emitter.h"
 #include <sstream>
 #include <ostream>
+#include <vector>
 
 namespace gbrecomp {
 namespace codegen {
@@ -175,11 +176,18 @@ private:
  * @brief Generate complete output from IR program
  */
 struct GeneratedOutput {
+    struct ExtraFile {
+        std::string filename;
+        std::string content;
+        bool is_source = false;
+    };
+
     std::string header_content;
     std::string source_content;
     std::string rom_data_content;
     std::string main_content;
     std::string cmake_content;
+    std::vector<ExtraFile> extra_files;
     
     std::string header_file;
     std::string source_file;
